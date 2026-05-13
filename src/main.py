@@ -762,16 +762,15 @@ def run(duration=None, device=None, verbose=False):
         state = chaos.step()
         eid, bid, mid = manifold.find_nearest(state)
 
-        # Use CA gates: only trigger if corresponding gate is 1
-        # Pick a gate index based on state[2]
+        # Use CA gates: always trigger, but gate=1 → full amp, gate=0 → half amp
         gate_idx = int(state[2] * 8) % 8
-        if trigger_gates[gate_idx]:
-            freq = map_state_to_freq(state)
-            # If L-system produced notes, mix them in occasionally
-            if melody_notes and np.random.rand() < 0.3:
-                freq = melody_notes[np.random.randint(0, len(melody_notes))]
-            amp = map_state_to_amp(state)
-            pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
+        freq = map_state_to_freq(state)
+        if melody_notes and np.random.rand() < 0.2:
+            freq = melody_notes[np.random.randint(0, len(melody_notes))]
+        amp = map_state_to_amp(state)
+        if not trigger_gates[gate_idx]:
+            amp *= 0.3  # gated voices are quieter but still present
+        pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
         pool.render(outdata.T)
 
         # 2. Multi-feature extraction
