@@ -727,7 +727,47 @@ class DelayNetwork:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 9d. Spectral analysis
+# 9d. Long-Term Feedback — 1s spectral averaging (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════
+
+class LongTermFeedback:
+    """Accumulates 1-second spectral averages, slowly modulates attractor params."""
+
+    def __init__(self, sr: int = SAMPLE_RATE):
+        self.sr = sr
+        self.centroid_buffer = []
+        self.flux_buffer = []
+        self.window_size = sr // BLOCK_SIZE  # ~172 frames for 1 second
+        # Current long-term targets (smoothed)
+        self.lt_centroid = 500.0
+        self.lt_flux = 50.0
+        self.lt_rms = 0.05
+
+    def feed(self, centroid: float, flux: float, rms: float):
+        """Add one frame of features."""
+        self.centroid_buffer.append(centroid)
+        self.flux_buffer.append(flux)
+        if len(self.centroid_buffer) > self.window_size:
+            self.centroid_buffer.pop(0)
+            self.flux_buffer.pop(0)
+
+    def tick(self) -> dict:
+        """Compute long-term averages and return modulation suggestions."""
+        if len(self.centroid_buffer) < 10:
+            return {}
+        avg_c = np.mean(self.centroid_buffer)
+        avg_f = np.mean(self.flux_buffer)
+        # Smooth targets
+        self.lt_centroid += (avg_c - self.lt_centroid) * 0.05
+        self.lt_flux += (avg_f - self.lt_flux) * 0.05
+        return {
+            'lt_brightness': min(self.lt_centroid / 5000.0, 1.0),  # 0=dark, 1=bright
+            'lt_activity': min(self.lt_flux / 500.0, 1.0),  # 0=calm, 1=busy
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9e. Spectral analysis
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
