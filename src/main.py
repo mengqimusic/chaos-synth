@@ -320,7 +320,8 @@ def run(duration=None, device=None):
             feedback_state['centroid_history'].pop(0)
 
         avg_centroid = np.mean(feedback_state['centroid_history'])
-        dr = np.clip((avg_centroid / 4000.0 - 1.0) * 0.15, -0.15, 0.15)
+        # Map avg centroid to r: dark(~500Hz)→3.5, neutral(~2500Hz)→3.7, bright(~5000Hz)→3.95
+        dr = np.clip((avg_centroid / 2500.0 - 1.5) * 0.25, -0.2, 0.25)
         logistic.r = np.clip(3.5 + dr, 3.5, 3.95)
 
         feedback_state['silence_counter'] += frames
@@ -333,6 +334,14 @@ def run(duration=None, device=None):
             outdata[:, 0] += noise
             outdata[:, 1] += noise
             feedback_state['silence_counter'] = 0
+
+        # Slow r drift: prevent lock-in at any single value
+        # Adds ~0.0001 per second of random walk, bounded
+        if 'r_drift' not in feedback_state:
+            feedback_state['r_drift'] = 0.0
+        feedback_state['r_drift'] += np.random.randn() * 0.00002
+        feedback_state['r_drift'] = np.clip(feedback_state['r_drift'], -0.05, 0.05)
+        logistic.r = np.clip(logistic.r + feedback_state['r_drift'], 3.5, 3.95)
 
     print(f"chaos-synth v0.1.0 [Phase 0 MVP]")
     print(f"  Logistic: r={logistic.r:.2f}")
