@@ -450,11 +450,37 @@ def map_state_to_amp(state: np.ndarray) -> float:
     return 0.05 + float(state[1]) * 0.45
 
 # ═══════════════════════════════════════════════════════════════════════
-# 9. Spectral centroid & audio callback (sounddevice)
+# ═══════════════════════════════════════════════════════════════════════
+# 9. Coupling Field — shared energy buffer (Phase 1)
+# ═══════════════════════════════════════════════════════════════════════
+
+class CouplingField:
+    """~1s ring buffer. Voices deposit RMS energy, read back for coupling."""
+
+    def __init__(self, length: int = 44100):
+        self.field = np.zeros(length, dtype=np.float32)
+        self.pos = 0
+
+    def read(self, offset: int = 0) -> float:
+        """Read field value at current position + offset."""
+        return float(self.field[(self.pos + offset) % len(self.field)])
+
+    def deposit(self, energy: float) -> None:
+        """Add energy to current position, clamp to 1.0. Advance."""
+        self.field[self.pos] = min(self.field[self.pos] + energy, 1.0)
+        self.pos = (self.pos + 1) % len(self.field)
+
+    def tick(self) -> None:
+        """Apply slow decay."""
+        self.field *= 0.9995
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9b. Spectral analysis
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
-    """计算频谱质心 (Hz)。纯 numpy，无分配（in-place FFT）。"""
+    """Spectral centroid in Hz. Pure numpy, no allocs."""
     windowed = signal * np.hanning(len(signal)).astype(np.float32)
     spectrum = np.abs(np.fft.rfft(windowed))
     freqs = np.fft.rfftfreq(len(signal), 1.0 / sr).astype(np.float32)
@@ -464,11 +490,8 @@ def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
     return float(np.sum(freqs * spectrum) / total)
 
 
-
-
-
 # ═══════════════════════════════════════════════════════════════════════
-# 10. Entry point — audio callback as closure for sounddevice 0.5.5
+# 10. Entry point — audio callback + feedback + coupling
 # ═══════════════════════════════════════════════════════════════════════
 
 def run(duration=None, device=None):
@@ -478,55 +501,79 @@ def run(duration=None, device=None):
     chaos = LorenzAttractor()
     manifold = ManifoldMapper(n_centroids=16)
     pool = VoicePool(capacity=128, max_active=16)
+    coupling = CouplingField()
 
     feedback_state = {
         'centroid_history': [],
+        'flux_history': [],
+        'zcr_history': [],
         'silence_counter': 0,
     }
 
-    # Closure: captures logistic, manifold, pool, feedback_state
+    # Audio callback as closure — captures all state
     def audio_callback(outdata, frames, time_info, status):
         outdata.fill(0.0)
 
+        # 1. Step chaos engine -> 3D state
         state = chaos.step()
-        exciter_id, body_id, modulator_id = manifold.find_nearest(state)
+        eid, bid, mid = manifold.find_nearest(state)
         freq = map_state_to_freq(state)
         amp = map_state_to_amp(state)
-        pool.trigger(exciter_id, body_id, modulator_id, freq, amp, float(state[2]))
+        pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
         pool.render(outdata.T)
 
+        # 2. Multi-feature extraction
         mono = outdata.mean(axis=1)
-        centroid = compute_spectral_centroid(mono, SAMPLE_RATE)
         rms = np.sqrt(np.mean(mono ** 2))
-        zcr = float(np.sum(np.abs(np.diff(np.sign(mono)))) / (2.0 * len(mono))) if len(mono) > 0 else 0.0
+        centroid = compute_spectral_centroid(mono, SAMPLE_RATE)
+        zcr = float(np.sum(np.abs(np.diff(np.sign(mono))))
+                    / (2.0 * len(mono))) if len(mono) > 0 else 0.0
+        prev = feedback_state['centroid_history'][-1] if feedback_state['centroid_history'] else centroid
+        flux = abs(centroid - prev)
 
+        # 3. Smooth histories (10-frame windows)
         feedback_state['centroid_history'].append(centroid)
-        if len(feedback_state['centroid_history']) > 10:
-            feedback_state['centroid_history'].pop(0)
+        feedback_state['flux_history'].append(flux)
+        feedback_state['zcr_history'].append(zcr)
+        for h in ['centroid_history', 'flux_history', 'zcr_history']:
+            if len(feedback_state[h]) > 10:
+                feedback_state[h].pop(0)
 
         avg_centroid = np.mean(feedback_state['centroid_history'])
-        # Feedback to Lorenz sigma (affects orbit shape)
-        # bright sound → sigma↓ (calmer), dark sound → sigma↑ (more chaotic)
+        avg_flux = np.mean(feedback_state['flux_history'])
+        avg_zcr = np.mean(feedback_state['zcr_history'])
+
+        # 4. Feedback: centroid -> Lorenz sigma (orbit shape)
         if hasattr(chaos, 'sigma'):
-            target_sigma = 6.0 + (1.0 - avg_centroid / 5000.0) * 9.0
+            target_sigma = 6.0 + (1.0 - min(avg_centroid / 5000.0, 1.0)) * 9.0
             chaos.sigma += (target_sigma - chaos.sigma) * 0.01
 
-        # Feedback to manifold density via root mean square
-        # low RMS → more density, high RMS → less
-        density_target = max(100, int(200 - rms * 5000))
+        # 5. Feedback: spectral flux -> dt (step size)
+        if hasattr(chaos, 'dt'):
+            target_dt = 0.005 + (1.0 - min(avg_flux / 1000.0, 1.0)) * 0.02
+            chaos.dt += (target_dt - chaos.dt) * 0.01
 
+        # 6. Feedback: ZCR -> active voice count
+        target_active = int(8 + (1.0 - min(avg_zcr, 1.0)) * 16)
+        pool.max_active = max(4, min(32, target_active))
+
+        # 7. Coupling field: deposit RMS, read back as extra gain
+        coupling.deposit(rms * 2.0)
+        coupling.tick()
+        extra = coupling.read()
+        outdata[:] *= (1.0 + extra * 0.3)
+
+        # 8. Cold start: inject noise after 500ms silence
         feedback_state['silence_counter'] += frames
-        rms = np.sqrt(np.mean(mono ** 2))
         if rms > 1e-4:
             feedback_state['silence_counter'] = 0
-
         if feedback_state['silence_counter'] > int(SAMPLE_RATE * 0.5):
             noise = np.random.randn(frames).astype(np.float32) * 0.01
             outdata[:, 0] += noise
             outdata[:, 1] += noise
             feedback_state['silence_counter'] = 0
 
-        # Slow attractor parameter drift (works for any chaos engine)
+        # 9. Slow attractor parameter drift
         if hasattr(chaos, 'sigma'):
             if 'sigma_drift' not in feedback_state:
                 feedback_state['sigma_drift'] = 0.0
@@ -534,12 +581,14 @@ def run(duration=None, device=None):
             feedback_state['sigma_drift'] = np.clip(feedback_state['sigma_drift'], -1.0, 1.0)
             chaos.sigma = np.clip(10.0 + feedback_state['sigma_drift'], 6.0, 15.0)
 
-    print(f"chaos-synth v0.2.0 [Phase 1 - Lorenz + 3D Manifold]")
+    print("chaos-synth v0.2.0 [Phase 1]")
     print(f"  Chaos: {type(chaos).__name__}")
-    print(f"  Manifold: {len(manifold.centroids)} centroids on [0,1]³")
+    print(f"  Manifold: {len(manifold.centroids)} centroids on [0,1]^3")
+
     print(f"  Pool: {pool.capacity} slots, max {pool.max_active} active")
-    print(f"  S/R: {SAMPLE_RATE}Hz, block: {BLOCK_SIZE}")
-    print(f"  Ctrl+C to stop")
+    print(f"  Coupling: ON, 44100-sample ring buffer")
+    print(f"  Feedback: centroid+flux+zcr+rms -> sigma+dt+voices+coupling")
+    print(f"  {SAMPLE_RATE}Hz / block {BLOCK_SIZE} / Ctrl+C to stop")
 
     stream = sd.OutputStream(
         samplerate=SAMPLE_RATE,

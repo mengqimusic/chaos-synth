@@ -1,0 +1,32 @@
+# Chaos Synth Phase 1 - Configuration
+[synthesis]
+sample_rate = 44100
+block_size = 256
+chaos_engine = "lorenz"
+n_centroids = 16
+pool_capacity = 128
+pool_max_active = 16
+coupling_length = 44100
+coupling_decay = 0.9995
+
+[lorenz]
+sigma = 10.0
+rho = 28.0
+beta = 2.667
+dt = 0.01
+
+[roessler]
+a = 0.2
+b = 0.2
+c = 5.7
+dt = 0.03
+
+[feedback]
+centroid_window = 10
+sigma_min = 6.0
+sigma_max = 15.0
+dt_min = 0.005
+dt_max = 0.025
+voices_min = 4
+voices_max = 32
+coupling_gain = 0.3
