@@ -65,6 +65,9 @@ _cb_state = {
     'trigger_gates': [True] * 8,
     'note_counter': 0,        # frames since last note change
     'held_freq': 440.0,       # currently held pitch (Hz)
+    'target_freq': 440.0,     # portamento target pitch (Hz)
+    'portamento_counter': 0,  # frames into current glide
+    'portamento_duration': 0, # total glide frames (coherence * 30)
     'feedback_state': {
         'centroid_history': [],
         'flux_history': [],
@@ -138,18 +141,32 @@ def _audio_callback(outdata, frames, time_info, status):
     gate_idx = int(state[2] * 8) % 8
 
     # Note-hold: mutation controls how often frequency changes
+    # Coherence controls portamento (log-domain glide) between notes
     N = max(1, int((1 - mutation) ** 3 * 140))
     if st['note_counter'] >= N:
         # New note: recompute frequency from current chaos state
-        freq = map_tonic_spread_to_freq(state, tonic, scale, pitch_spread)
+        new_freq = map_tonic_spread_to_freq(state, tonic, scale, pitch_spread)
         # L-system melody override only at note boundaries
         if melody_notes and np.random.rand() < 0.2:
-            freq = melody_notes[np.random.randint(0, len(melody_notes))]
-        st['held_freq'] = freq
+            new_freq = melody_notes[np.random.randint(0, len(melody_notes))]
+        # Portamento setup: glide from current held_freq → target_freq
+        # coherence=0 → duration=0 (hard cut), coherence=1 → 30 frames (~174ms)
+        st['target_freq'] = new_freq
+        st['portamento_duration'] = int(coherence * 30)
+        st['portamento_counter'] = 0
         st['note_counter'] = 0
+    # Portamento glide: logarithmic interpolation for perceptually smooth pitch slide
+    if st['portamento_counter'] < st['portamento_duration']:
+        t = st['portamento_counter'] / st['portamento_duration']
+        log_old = np.log2(st['held_freq'])
+        log_new = np.log2(st['target_freq'])
+        st['held_freq'] = float(2 ** (log_old + (log_new - log_old) * t))
+        st['portamento_counter'] += 1
     else:
-        freq = st['held_freq']
-        st['note_counter'] += 1
+        # Glide complete (or duration=0), snap to target
+        st['held_freq'] = st['target_freq']
+    freq = st['held_freq']
+    st['note_counter'] += 1
 
     amp = map_dynamic_to_amp(state, dynamic)
 
