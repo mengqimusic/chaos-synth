@@ -357,7 +357,6 @@ def run(duration=None, device=None):
         channels=2,
         dtype='float32',
         callback=audio_callback,
-        callback_user_data=user_data,
         device=device,
     )
 
