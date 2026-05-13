@@ -170,13 +170,14 @@ def exciter_chirp(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
 
 
 def exciter_pluck(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
-    """#6: Physical pluck (Karplus-Strong). 512 samples."""
+    """#6: Physical pluck (Karplus-Strong). Dynamic buffer, min 512 samples."""
     delay = max(int(sr / freq), 4)
-    out = np.zeros(512, dtype=np.float32)
+    buf_size = max(delay + 4, 512)  # ensure buffer fits the initial noise fill
+    out = np.zeros(buf_size, dtype=np.float32)
     out[:delay] = (np.random.rand(delay).astype(np.float32) * 2.0 - 1.0) * 0.5
-    for i in range(delay, len(out)):
+    for i in range(delay, buf_size):
         out[i] = (out[i - delay] + out[i - delay + 1]) * 0.5 * 0.99
-    out *= np.exp(-np.arange(len(out), dtype=np.float32) / (float(sr) * 0.03))
+    out *= np.exp(-np.arange(buf_size, dtype=np.float32) / (float(sr) * 0.03))
     return out
 
 
@@ -520,8 +521,10 @@ class VoicePool:
         return sum(1 for v in self.voices if v['active'])
 
     def trigger(self, exciter_id: int, body_id: int, modulator_id: int,
-                freq: float, amp: float, chaos_x: float) -> None:
-        """Spawn a new voice. Steals oldest if at max_active."""
+                freq: float, amp: float, chaos_x: float,
+                self_sample: np.ndarray = None) -> None:
+        """Spawn a new voice. Steals oldest if at max_active.
+        self_sample: optional buffer for exciter #11 transient snatch."""
         if self._active_count() >= self.max_active:
             oldest_i, oldest_t = 0, float('inf')
             for i, v in enumerate(self.voices):
@@ -535,10 +538,14 @@ class VoicePool:
         self._trigger_clock += 1
 
         # Render the full grain: exciter → body → modulator
-        efn = EXCITERS.get(exciter_id, exciter_sine_impulse)
+        if exciter_id == 11 and self_sample is not None and len(self_sample) > 0:
+            # Use self-sampled audio for transient snatch
+            excitation = self_sample.astype(np.float32) * 0.8
+        else:
+            efn = EXCITERS.get(exciter_id, exciter_sine_impulse)
+            excitation = efn(freq, SAMPLE_RATE)
         bfn = BODIES.get(body_id, body_dry)
-        mfn = MODULATORS.get(modulator_id, modulator_static)
-        grain = bfn(efn(freq, SAMPLE_RATE), freq, SAMPLE_RATE)
+        grain = bfn(excitation, freq, SAMPLE_RATE)
         # Apply modulator
         if modulator_id == 1:
             grain = modulator_tremolo(grain, freq=5.0)

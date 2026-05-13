@@ -9,11 +9,11 @@ from scipy.io import wavfile
 from main import *
 
 # Performance params
-DURATION = 5
-TONIC = 0.5
-SCALE = "Pentatonic"
-PITCH_SPREAD = 0.3
-DYNAMIC = 0.5
+DURATION = 15  # longer to hear long-term feedback evolution
+TONIC = 0.45
+SCALE = "Minor"
+PITCH_SPREAD = 0.6
+DYNAMIC = 0.55
 
 OUTPUT = "/Users/mengwu/Documents/Code/chaos-synth/output/phase3_render.wav"
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
@@ -26,7 +26,9 @@ ca = CellularAutomaton(width=64, rule=30)
 lsys = LSystem("ABCB", {"A": "ABC", "B": "BAB", "C": "CA"})
 
 # Phase 3 components
+ssb = SelfSampleBuffer(duration_s=2.0)
 delay_net = DelayNetwork()
+delay_net.wet_mix = 0.45  # more audible than default 0.3
 ltfb = LongTermFeedback()
 ltfb_frame_counter = 0
 
@@ -64,11 +66,16 @@ while written < total_frames:
     amp = map_dynamic_to_amp(state, DYNAMIC)
     if not trigger_gates[int(state[2]*8) % 8]:
         amp *= 0.3
-    pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
+    # Phase 3: pass self-sample buffer for exciter #11 (transient snatch)
+    sample_buf = ssb.snatch() if eid == 11 else None
+    pool.trigger(eid, bid, mid, freq, amp, float(state[2]), self_sample=sample_buf)
 
     buf = out.T.copy()
     pool.render(buf)
     out[:] = buf.T
+
+    # Phase 3a: write to self-sample ring buffer (for exciter #11)
+    ssb.write(out.T.copy())
 
     # Feature extraction + long-term feedback
     mono = out.mean(axis=1)
