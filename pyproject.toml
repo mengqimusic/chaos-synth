@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chaos-synth"
+version = "0.1.0"
+description = "A chaotic system synthesizer exploring Lorenz, Rössler, and Chua attractors for audio generation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Mengwu", email = "mengwu@example.com"}
+]
+keywords = ["chaos", "synthesizer", "audio", "dsp", "lorenz", "rossler", "chua"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Synthesis",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "sounddevice>=0.4.6",
+]
+
+[project.optional-dependencies]
+viz = ["pyqtgraph>=0.13"]
+
+[project.scripts]
+chaos-synth = "main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
