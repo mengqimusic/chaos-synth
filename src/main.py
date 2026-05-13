@@ -138,7 +138,65 @@ def exciter_click(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
     return buf
 
 
-EXCITERS = {0: exciter_sine_impulse, 1: exciter_noise_burst, 4: exciter_click}
+def exciter_fm_spark(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#2: FM spark. carrier=freq, modulator=freq*2, mod_idx=3. 256 samples."""
+    t = np.arange(256, dtype=np.float32) / float(sr)
+    mod = np.sin(2.0 * np.pi * freq * 2.0 * t) * 3.0
+    sig = np.sin(2.0 * np.pi * freq * t + mod)
+    env = np.exp(-t * 40.0)
+    return (sig * env).astype(np.float32)
+
+
+def exciter_granular_micro(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#3: Granular micro. 4 sub-grains, clipped to 128 max per grain."""
+    out = np.zeros(256, dtype=np.float32)
+    for i in range(4):
+        g_len = min(np.random.randint(max(4, int(sr * 0.003)), int(sr * 0.008)), 128)
+        g_start = np.random.randint(0, max(1, 256 - g_len))
+        g_pitch = freq * (0.8 + np.random.rand() * 0.4)
+        t = np.arange(g_len, dtype=np.float32) / float(sr)
+        g = np.sin(2.0 * np.pi * g_pitch * t) * np.hanning(g_len).astype(np.float32)
+        out[g_start:g_start + g_len] += g[:g_len] * 0.25
+    return out
+
+
+def exciter_chirp(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#5: Frequency sweep from freq to freq*4, 256 samples."""
+    t = np.arange(256, dtype=np.float32) / float(sr)
+    phase = 2.0 * np.pi * freq * (t + 3.0 * t ** 2 * freq)
+    sig = np.sin(phase)
+    env = np.exp(-t * 15.0)
+    return (sig * env).astype(np.float32)
+
+
+def exciter_pluck(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#6: Physical pluck (Karplus-Strong). 512 samples."""
+    delay = max(int(sr / freq), 4)
+    out = np.zeros(512, dtype=np.float32)
+    out[:delay] = (np.random.rand(delay).astype(np.float32) * 2.0 - 1.0) * 0.5
+    for i in range(delay, len(out)):
+        out[i] = (out[i - delay] + out[i - delay + 1]) * 0.5 * 0.99
+    out *= np.exp(-np.arange(len(out), dtype=np.float32) / (float(sr) * 0.03))
+    return out
+
+
+def exciter_wavetable(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#7: Wavetable scan. Sine sweep through variable shapes, 512 samples."""
+    length = 512
+    t = np.arange(length, dtype=np.float32)
+    phase = t * freq / float(sr)
+    # Scan from sine to saw by mixing
+    mix = t / float(length)  # 0->1 over the grain
+    sine = np.sin(2.0 * np.pi * phase)
+    saw = 2.0 * (phase - np.floor(phase + 0.5))
+    return ((1.0 - mix) * sine + mix * saw).astype(np.float32)
+
+
+EXCITERS = {
+    0: exciter_sine_impulse, 1: exciter_noise_burst, 2: exciter_fm_spark,
+    3: exciter_granular_micro, 4: exciter_click, 5: exciter_chirp,
+    6: exciter_pluck, 7: exciter_wavetable,
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -174,7 +232,44 @@ def body_comb(excitation: np.ndarray, freq: float,
     return out
 
 
-BODIES = {0: body_dry, 1: body_modal, 2: body_comb}
+def body_allpass(excitation: np.ndarray, freq: float,
+                 sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#3: Cascaded allpass filter (reverb tail feel). 4 stages."""
+    delay = max(int(float(sr) / freq / 4.0), 2)
+    g = 0.5
+    out = excitation.copy().astype(np.float32)
+    for _ in range(4):
+        buf = np.zeros(delay, dtype=np.float32)
+        for i in range(len(out)):
+            dly = buf[i % delay]
+            buf[i % delay] = out[i] + g * dly
+            out[i] = -g * out[i] + dly
+    return out
+
+
+def body_nonlinear(excitation: np.ndarray, freq: float,
+                   sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#4: Saturation chain. 3 stages of tanh distortion."""
+    out = excitation.copy().astype(np.float32)
+    for _ in range(3):
+        out = np.tanh(out * 2.0) * 1.2
+    return out
+
+
+def body_freeze(excitation: np.ndarray, freq: float,
+                sr: int = SAMPLE_RATE) -> np.ndarray:
+    """#5: Granular freeze. Repeat first 64 samples, 3 iterations."""
+    loop = excitation[:min(64, len(excitation))].copy()
+    out = excitation.copy()
+    for i in range(3):
+        start = min(len(out), len(loop))
+        end = min(len(out), start + 64)
+        out[start:end] += loop[:end - start] * 0.3
+    return out
+
+
+BODIES = {0: body_dry, 1: body_modal, 2: body_comb, 3: body_allpass,
+          4: body_nonlinear, 5: body_freeze}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -186,7 +281,37 @@ def modulator_static(buf: np.ndarray) -> np.ndarray:
     return buf
 
 
-MODULATORS = {0: modulator_static}
+def modulator_tremolo(buf: np.ndarray, freq: float = 5.0) -> np.ndarray:
+    """#1: Amplitude modulation at 5 Hz."""
+    t = np.arange(len(buf), dtype=np.float32) / SAMPLE_RATE
+    lfo = 0.5 + 0.5 * np.sin(2.0 * np.pi * freq * t)
+    return (buf * lfo).astype(np.float32)
+
+
+def modulator_vibrato(buf: np.ndarray, freq: float = 5.0, depth: float = 0.003) -> np.ndarray:
+    """#2: Frequency modulation (done as phase offset on delay). 256-sample buffer.
+    Simple implementation: modulate linear interpolation within buffer."""
+    n = len(buf)
+    t = np.arange(n, dtype=np.float32)
+    mod = 1.0 + depth * np.sin(2.0 * np.pi * freq * t / SAMPLE_RATE * n)
+    indices = np.clip(np.arange(n, dtype=np.float32) * mod, 0, n - 1).astype(np.int32)
+    return (buf[indices]).astype(np.float32)
+
+
+def modulator_phase_dist(buf: np.ndarray, distortion: float = 0.5) -> np.ndarray:
+    """#3: Phase distortion. Read buffer through a bent phase (Casio CZ style)."""
+    n = len(buf)
+    phase = np.arange(n, dtype=np.float32) / float(n)
+    bent = phase + distortion * np.sin(2.0 * np.pi * phase)
+    bent = bent / bent.max() * (n - 1)
+    idx = bent.astype(np.int32)
+    frac = bent - idx
+    idx = np.clip(idx, 0, n - 2)
+    return (buf[idx] * (1.0 - frac) + buf[idx + 1] * frac).astype(np.float32)
+
+
+MODULATORS = {0: modulator_static, 1: modulator_tremolo,
+              2: modulator_vibrato, 3: modulator_phase_dist}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -266,7 +391,16 @@ class VoicePool:
         efn = EXCITERS.get(exciter_id, exciter_sine_impulse)
         bfn = BODIES.get(body_id, body_dry)
         mfn = MODULATORS.get(modulator_id, modulator_static)
-        grain = mfn(bfn(efn(freq, SAMPLE_RATE), freq, SAMPLE_RATE))
+        grain = bfn(efn(freq, SAMPLE_RATE), freq, SAMPLE_RATE)
+        # Apply modulator (some need freq for LFO rate)
+        if modulator_id == 1:
+            grain = modulator_tremolo(grain, freq=5.0)
+        elif modulator_id == 2:
+            grain = modulator_vibrato(grain, freq=5.0, depth=0.003)
+        elif modulator_id == 3:
+            grain = modulator_phase_dist(grain, distortion=0.5)
+        else:
+            grain = modulator_static(grain)
         grain = np.clip(grain * amp, -1.0, 1.0).astype(np.float32)
 
         v = self.voices[slot]
