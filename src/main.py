@@ -281,64 +281,17 @@ def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
     return float(np.sum(freqs * spectrum) / total)
 
 
-def audio_callback(outdata, frames, time_info, status, user_data):
-    """每帧调用的音频回调"""
-    logistic, manifold, pool, feedback_state = user_data
 
-    # 清空输出 buffer
-    outdata.fill(0.0)
-
-    # 步进 Logistic map
-    x = logistic.step()
-
-    # 找最近质心 → 技术组合
-    exciter_id, body_id = manifold.find_nearest(x)
-
-    # 触发新语音（每 callback 触发一次，density 由 logistic 自然节奏驱动）
-    freq = map_x_to_freq(x)
-    amp = map_x_to_amp(x)
-    pool.trigger(exciter_id, body_id, freq, amp, x)
-
-    # 渲染活跃语音到输出
-    pool.render(outdata.T, SAMPLE_RATE)
-
-    # 分析输出 → 反馈（非阻塞，纯 numpy）
-    mono = outdata.mean(axis=1)  # stereo → mono
-    centroid = compute_spectral_centroid(mono, SAMPLE_RATE)
-
-    # 反馈：spectral centroid → 调制 logistic.r
-    # centroid 低 (dark) → r 增大 → 进入混沌 → 声音变杂 → centroid 升高
-    # centroid 高 (bright) → r 减小 → 退出混沌 → 声音变纯 → centroid 降低
-    # 形成自调节闭环
-    feedback_state['centroid_history'].append(centroid)
-    if len(feedback_state['centroid_history']) > 10:
-        feedback_state['centroid_history'].pop(0)
-
-    avg_centroid = np.mean(feedback_state['centroid_history'])
-    # 映射 centroid (0~8000 Hz) → r 偏移 (-0.15 ~ +0.15)
-    dr = np.clip((avg_centroid / 4000.0 - 1.0) * 0.15, -0.15, 0.15)
-    logistic.r = np.clip(3.5 + dr, 3.5, 3.95)
-
-    # 冷启动检测
-    feedback_state['silence_counter'] += frames
-    rms = np.sqrt(np.mean(mono ** 2))
-    if rms > 1e-4:
-        feedback_state['silence_counter'] = 0
-
-    # 500ms 静默 → 注入噪声底噪
-    if feedback_state['silence_counter'] > int(SAMPLE_RATE * 0.5):
-        noise = np.random.randn(frames).astype(np.float32) * 0.01  # -40dB
-        outdata[:, 0] += noise
-        outdata[:, 1] += noise
-        feedback_state['silence_counter'] = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 10. Entry point
+# 10. Entry point — audio callback as closure for sounddevice 0.5.5
 # ═══════════════════════════════════════════════════════════════════════
 
 def run(duration=None, device=None):
-    """启动合成器。duration=None 为无限运行（Ctrl+C 退出）。"""
+    """Launch the synth. duration=None runs forever (Ctrl+C to stop)."""
+    import sounddevice as sd
+
     logistic = LogisticMap(r=3.7, x0=0.5)
     manifold = ManifoldMapper()
     pool = VoicePool(capacity=128, max_active=8)
@@ -348,9 +301,46 @@ def run(duration=None, device=None):
         'silence_counter': 0,
     }
 
-    user_data = (logistic, manifold, pool, feedback_state)
+    # Closure: captures logistic, manifold, pool, feedback_state
+    def audio_callback(outdata, frames, time_info, status):
+        outdata.fill(0.0)
 
-    # 创建输出流
+        x = logistic.step()
+        exciter_id, body_id = manifold.find_nearest(x)
+        freq = map_x_to_freq(x)
+        amp = map_x_to_amp(x)
+        pool.trigger(exciter_id, body_id, freq, amp, x)
+        pool.render(outdata.T)
+
+        mono = outdata.mean(axis=1)
+        centroid = compute_spectral_centroid(mono, SAMPLE_RATE)
+
+        feedback_state['centroid_history'].append(centroid)
+        if len(feedback_state['centroid_history']) > 10:
+            feedback_state['centroid_history'].pop(0)
+
+        avg_centroid = np.mean(feedback_state['centroid_history'])
+        dr = np.clip((avg_centroid / 4000.0 - 1.0) * 0.15, -0.15, 0.15)
+        logistic.r = np.clip(3.5 + dr, 3.5, 3.95)
+
+        feedback_state['silence_counter'] += frames
+        rms = np.sqrt(np.mean(mono ** 2))
+        if rms > 1e-4:
+            feedback_state['silence_counter'] = 0
+
+        if feedback_state['silence_counter'] > int(SAMPLE_RATE * 0.5):
+            noise = np.random.randn(frames).astype(np.float32) * 0.01
+            outdata[:, 0] += noise
+            outdata[:, 1] += noise
+            feedback_state['silence_counter'] = 0
+
+    print(f"chaos-synth v0.1.0 [Phase 0 MVP]")
+    print(f"  Logistic: r={logistic.r:.2f}")
+    print(f"  Manifold: 4 centroids, combos={manifold.combos}")
+    print(f"  Pool: {pool.capacity} slots, max {pool.max_active} active")
+    print(f"  S/R: {SAMPLE_RATE}Hz, block: {BLOCK_SIZE}")
+    print(f"  Ctrl+C to stop")
+
     stream = sd.OutputStream(
         samplerate=SAMPLE_RATE,
         blocksize=BLOCK_SIZE,
@@ -359,13 +349,6 @@ def run(duration=None, device=None):
         callback=audio_callback,
         device=device,
     )
-
-    print(f"chaos-synth v0.1.0 [Phase 0 MVP]")
-    print(f"  Logistic: r={logistic.r:.2f}")
-    print(f"  Manifold: 4 centroids, combos={manifold.combos}")
-    print(f"  Pool: 128 slots, max 8 active")
-    print(f"  S/R: {SAMPLE_RATE}Hz, block: {BLOCK_SIZE}")
-    print(f"  Ctrl+C to stop")
 
     try:
         with stream:
@@ -378,5 +361,5 @@ def run(duration=None, device=None):
         print('\nStopped.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run()
