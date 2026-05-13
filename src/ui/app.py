@@ -63,6 +63,8 @@ _cb_state = {
     'lsys_counter': 0,
     'ltfb_frame': 0,
     'trigger_gates': [True] * 8,
+    'note_counter': 0,        # frames since last note change
+    'held_freq': 440.0,       # currently held pitch (Hz)
     'feedback_state': {
         'centroid_history': [],
         'flux_history': [],
@@ -134,9 +136,21 @@ def _audio_callback(outdata, frames, time_info, status):
 
     # ── 2. Map to frequency & amplitude ───────────────────────────────
     gate_idx = int(state[2] * 8) % 8
-    freq = map_tonic_spread_to_freq(state, tonic, scale, pitch_spread)
-    if melody_notes and np.random.rand() < 0.2:
-        freq = melody_notes[np.random.randint(0, len(melody_notes))]
+
+    # Note-hold: mutation controls how often frequency changes
+    N = max(1, int((1 - mutation) ** 3 * 140))
+    if st['note_counter'] >= N:
+        # New note: recompute frequency from current chaos state
+        freq = map_tonic_spread_to_freq(state, tonic, scale, pitch_spread)
+        # L-system melody override only at note boundaries
+        if melody_notes and np.random.rand() < 0.2:
+            freq = melody_notes[np.random.randint(0, len(melody_notes))]
+        st['held_freq'] = freq
+        st['note_counter'] = 0
+    else:
+        freq = st['held_freq']
+        st['note_counter'] += 1
+
     amp = map_dynamic_to_amp(state, dynamic)
 
     # Density: reduce gate penalty
@@ -183,8 +197,9 @@ def _audio_callback(outdata, frames, time_info, status):
     for _ in range(extra_count):
         extra_state = _chaos.step()
         eeid, ebid, emid = _manifold.find_nearest(extra_state)
-        efreq = map_tonic_spread_to_freq(extra_state, tonic, scale, pitch_spread)
         eamp = map_dynamic_to_amp(extra_state, dynamic) * 0.4
+        # Use the same held frequency for extra voices
+        efreq = freq
         if not st['trigger_gates'][int(extra_state[2] * 8) % 8]:
             eamp *= max(0.05, 1.0 - density)
         _pool.trigger(eeid, ebid, emid, efreq, eamp, float(extra_state[2]))
