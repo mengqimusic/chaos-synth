@@ -491,6 +491,78 @@ def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Generative Layer — Cellular Automata + L-System (Phase 2)
+# ═══════════════════════════════════════════════════════════════════════
+
+class CellularAutomaton:
+    """1D cellular automaton. Rule 30 or 110 for rhythm triggering."""
+
+    def __init__(self, width: int = 64, rule: int = 30):
+        self.width = width
+        self.rule = rule
+        self.cells = np.zeros(width, dtype=np.uint8)
+        self.cells[width // 2] = 1  # single seed in middle
+        self.step_count = 0
+
+    def step(self) -> np.ndarray:
+        """Advance one generation. Returns current row as uint8 array."""
+        new_cells = np.zeros(self.width, dtype=np.uint8)
+        for i in range(self.width):
+            left = self.cells[(i - 1) % self.width]
+            center = self.cells[i]
+            right = self.cells[(i + 1) % self.width]
+            pattern = (left << 2) | (center << 1) | right
+            new_cells[i] = (self.rule >> pattern) & 1
+        self.cells = new_cells
+        self.step_count += 1
+        return self.cells
+
+    def trigger_pattern(self) -> list:
+        """Return list of 8 bools from current row for voice triggering."""
+        # Sample 8 evenly-spaced positions
+        step = max(1, self.width // 8)
+        return [bool(self.cells[i * step]) for i in range(8)]
+
+
+class LSystem:
+    """L-System for melody generation."""
+
+    def __init__(self, axiom: str = "A", rules: dict = None, angle: float = 60.0):
+        self.axiom = axiom
+        self.rules = rules or {"A": "AB", "B": "A"}  # Fibonacci L-system
+        self.string = axiom
+        self.generation = 0
+
+    def iterate(self) -> str:
+        """Apply production rules in parallel. Returns new string."""
+        result = []
+        for ch in self.string:
+            result.append(self.rules.get(ch, ch))
+        self.string = "".join(result)
+        self.generation += 1
+        return self.string
+
+    def to_notes(self, base_freq: float = 220.0, scale: list = None) -> list:
+        """Convert L-system string to MIDI-style frequency list.
+        Maps characters to scale degrees."""
+        if scale is None:
+            scale = [0, 2, 4, 5, 7, 9, 11]  # major scale degrees
+        notes = []
+        n = len(self.string)
+        for i, ch in enumerate(self.string):
+            if ch in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
+                degree = (ord(ch) - ord('A')) % len(scale)
+                octave = 4 + (i % 3)  # spread across 3 octaves
+                freq = base_freq * (2.0 ** ((octave - 4) + scale[degree] / 12.0))
+                notes.append(freq)
+        return notes if notes else [440.0]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+
 # 10. Entry point — audio callback + feedback + coupling
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -502,7 +574,12 @@ def run(duration=None, device=None):
     manifold = ManifoldMapper(n_centroids=16)
     pool = VoicePool(capacity=128, max_active=16)
     coupling = CouplingField()
+    ca = CellularAutomaton(width=64, rule=30)
+    lsys = LSystem(axiom="ABCB", rules={"A": "ABC", "B": "BAB", "C": "CA"})
+    lsys_callback_counter = 0
+    ca_callback_counter = 0
 
+    trigger_gates = [True] * 8  # initial: all gates open
     feedback_state = {
         'centroid_history': [],
         'flux_history': [],
@@ -514,12 +591,36 @@ def run(duration=None, device=None):
     def audio_callback(outdata, frames, time_info, status):
         outdata.fill(0.0)
 
+        nonlocal ca_callback_counter, lsys_callback_counter, trigger_gates
+
+        # 0. Generative layer: CA rhythm + L-System melody
+        ca_callback_counter += 1
+        ca_step_interval = 4  # step CA every 4 callbacks (~23ms)
+        if ca_callback_counter % ca_step_interval == 0:
+            ca.step()
+            trigger_gates = ca.trigger_pattern()  # 8 bools
+
+        lsys_callback_counter += 1
+        lsys_step_interval = 20  # iterate L-system every 20 callbacks (~116ms)
+        if lsys_callback_counter % lsys_step_interval == 0:
+            lsys.iterate()
+            ca.step()  # CA evolves with L-system
+        melody_notes = lsys.to_notes(base_freq=110.0) if lsys_callback_counter % lsys_step_interval == 0 else []
+
         # 1. Step chaos engine -> 3D state
         state = chaos.step()
         eid, bid, mid = manifold.find_nearest(state)
-        freq = map_state_to_freq(state)
-        amp = map_state_to_amp(state)
-        pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
+
+        # Use CA gates: only trigger if corresponding gate is 1
+        # Pick a gate index based on state[2]
+        gate_idx = int(state[2] * 8) % 8
+        if trigger_gates[gate_idx]:
+            freq = map_state_to_freq(state)
+            # If L-system produced notes, mix them in occasionally
+            if melody_notes and np.random.rand() < 0.3:
+                freq = melody_notes[np.random.randint(0, len(melody_notes))]
+            amp = map_state_to_amp(state)
+            pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
         pool.render(outdata.T)
 
         # 2. Multi-feature extraction
@@ -588,6 +689,8 @@ def run(duration=None, device=None):
     print(f"  Pool: {pool.capacity} slots, max {pool.max_active} active")
     print(f"  Coupling: ON, 44100-sample ring buffer")
     print(f"  Feedback: centroid+flux+zcr+rms -> sigma+dt+voices+coupling")
+    print(f"  CA: Rule 30, 64 cells, gate interval 4 (step=4)")
+    print(f"  LS: 3 rules, axiom=ABCB, interval 20")
     print(f"  {SAMPLE_RATE}Hz / block {BLOCK_SIZE} / Ctrl+C to stop")
 
     stream = sd.OutputStream(
