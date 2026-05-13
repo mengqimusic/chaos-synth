@@ -130,12 +130,19 @@ def _audio_callback(outdata, frames, time_info, status):
     state = _chaos.step()
     eid, bid, mid = _manifold.find_nearest(state)
 
-    # Material: bias body selection (higher = richer bodies)
-    if np.random.rand() < abs(material - 0.5) * 0.4:
+    # Material: bias body selection (0=transient, 1=resonant)
+    TRANSIENT_BODIES = {0, 2, 4, 5}   # dry, comb, nonlinear, freeze
+    RESONANT_BODIES  = {1, 3, 6, 7, 8, 9}  # modal, allpass, waveguide, saturation, blur, pshift
+    switch_prob = abs(material - 0.5) * 2.0  # 0 at center, 1 at extremes
+    if np.random.rand() < switch_prob:
         if material > 0.5:
-            bid = min(bid + np.random.randint(1, 4), 9)
+            # Bias toward resonant
+            if bid in TRANSIENT_BODIES:
+                bid = int(np.random.choice(list(RESONANT_BODIES)))
         else:
-            bid = max(bid - np.random.randint(1, 3), 0)
+            # Bias toward transient
+            if bid in RESONANT_BODIES:
+                bid = int(np.random.choice(list(TRANSIENT_BODIES)))
 
     # ── 2. Map to frequency & amplitude ───────────────────────────────
     gate_idx = int(state[2] * 8) % 8

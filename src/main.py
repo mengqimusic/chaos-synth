@@ -85,15 +85,15 @@ CHAOS_ENGINES = {
 class ManifoldMapper:
     """3D Voronoi tessellation: nearest-centroid → (exciter, body, mod)."""
 
-    def __init__(self, n_centroids: int = 16, seed: int = 42):
+    def __init__(self, n_centroids: int = 32, seed: int = 42):
         rng = np.random.RandomState(seed)
         self.centroids = rng.rand(n_centroids, 3).astype(np.float32)
-        # Assign combos spread across module space
+        # Assign combos spread across full module space
         self.combos = []
         for i in range(n_centroids):
-            e = i % 8   # exciter 0-7
-            b = (i // 2) % 6  # body 0-5
-            m = (i // 4) % 4  # modulator 0-3
+            e = i % 12  # exciter 0-11
+            b = i % 10  # body 0-9
+            m = i % 7   # modulator 0-6
             self.combos.append((e, b, m))
 
     def find_nearest(self, point: np.ndarray) -> tuple:
