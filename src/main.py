@@ -782,6 +782,58 @@ def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 8b. Scale Definitions + Performance Handle Mapping (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════
+
+SCALES = {
+    'Chromatic': list(range(12)),
+    'Pentatonic': [0, 2, 4, 7, 9],
+    'Major': [0, 2, 4, 5, 7, 9, 11],
+    'Minor': [0, 2, 3, 5, 7, 8, 10],
+    'Microtonal': [0, 0.5, 1, 1.5, 2, 3, 3.5, 4, 5, 5.5, 6, 7, 7.5, 8, 9, 9.5, 10, 11, 11.5],
+    'Harmonic': [0, 2, 4, 7, 12, 14, 16, 19, 24],
+}
+
+
+def quantize_to_scale(freq: float, tonic: float, scale_name: str) -> float:
+    """Snap a frequency to the nearest scale degree relative to tonic."""
+    if scale_name not in SCALES or scale_name == 'Chromatic':
+        return freq  # Chromatic = no quantization
+    scale_degrees = SCALES[scale_name]
+    if freq <= 0 or tonic <= 0:
+        return freq
+    semitones_from_tonic = 12.0 * np.log2(freq / tonic)
+    octave = np.floor(semitones_from_tonic / 12.0)
+    semitone_in_octave = semitones_from_tonic - octave * 12.0
+    best_dist = 12.0
+    best_degree = 0.0
+    for sd in scale_degrees:
+        for shift in [-12, 0, 12]:
+            candidate = sd + shift
+            dist = abs(semitone_in_octave - candidate)
+            if dist < best_dist:
+                best_dist = dist
+                best_degree = candidate
+    quantized_semitones = octave * 12.0 + best_degree
+    return tonic * (2.0 ** (quantized_semitones / 12.0))
+
+
+def map_tonic_spread_to_freq(state: np.ndarray, tonic_norm: float,
+                              scale_name: str, pitch_spread: float) -> float:
+    """Map chaos state to frequency using tonic and pitch spread controls."""
+    tonic_hz = 27.5 * (2.0 ** (tonic_norm * 7.25))  # A0 (~27.5) to ~4200 Hz
+    spread_octaves = 0.5 + pitch_spread * 4.5  # 0.5 to 5.0 octaves
+    deviation = (float(state[0]) - 0.5) * 2.0 * spread_octaves
+    freq = tonic_hz * (2.0 ** deviation)
+    return quantize_to_scale(freq, tonic_hz, scale_name)
+
+
+def map_dynamic_to_amp(state: np.ndarray, dynamic_norm: float) -> float:
+    """Map chaos state to amplitude using dynamic range control."""
+    amp_base = 0.01 + dynamic_norm * 0.49  # 0.01 to 0.5
+    range_factor = 0.3 + dynamic_norm * 9.7  # 0.3 to 10.0
+    deviation = (float(state[1]) - 0.5) * range_factor
+    return float(np.clip(amp_base + deviation * 0.05, 0.001, 1.0))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -859,8 +911,16 @@ class LSystem:
 # 10. Entry point — audio callback + feedback + coupling
 # ═══════════════════════════════════════════════════════════════════════
 
-def run(duration=None, device=None, verbose=False):
-    """Launch the synth. duration=None runs forever (Ctrl+C to stop)."""
+def run(duration=None, device=None, verbose=False,
+        tonic=0.5, scale="Pentatonic", pitch_spread=0.3, dynamic=0.5):
+    """Launch the synth. duration=None runs forever (Ctrl+C to stop).
+    
+    Performance params (all 0.0-1.0 normalized):
+      tonic: root pitch (0=A0/27.5Hz, 1=~4.2kHz)
+      scale: one of 'Chromatic','Pentatonic','Major','Minor','Microtonal','Harmonic'
+      pitch_spread: octave range (0=0.5 oct, 1=5.0 oct)
+      dynamic: amplitude range (0=quiet/flat, 1=loud/wide)
+    """
     import sounddevice as sd
 
     chaos = LorenzAttractor()
@@ -871,6 +931,12 @@ def run(duration=None, device=None, verbose=False):
     lsys = LSystem(axiom="ABCB", rules={"A": "ABC", "B": "BAB", "C": "CA"})
     lsys_callback_counter = 0
     ca_callback_counter = 0
+
+    # Phase 3: new engine components
+    ssb = SelfSampleBuffer(duration_s=2.0)
+    delay_net = DelayNetwork()
+    ltfb = LongTermFeedback()
+    ltfb_frame_counter = 0  # tick every ~172 frames (1 second)
 
     trigger_gates = [True] * 8  # initial: all gates open
     feedback_state = {
@@ -884,7 +950,7 @@ def run(duration=None, device=None, verbose=False):
     def audio_callback(outdata, frames, time_info, status):
         outdata.fill(0.0)
 
-        nonlocal ca_callback_counter, lsys_callback_counter, trigger_gates
+        nonlocal ca_callback_counter, lsys_callback_counter, trigger_gates, ltfb_frame_counter
 
         # 0. Generative layer: CA rhythm + L-System melody
         ca_callback_counter += 1
@@ -906,14 +972,17 @@ def run(duration=None, device=None, verbose=False):
 
         # Use CA gates: always trigger, but gate=1 → full amp, gate=0 → half amp
         gate_idx = int(state[2] * 8) % 8
-        freq = map_state_to_freq(state)
+        freq = map_tonic_spread_to_freq(state, tonic, scale, pitch_spread)
         if melody_notes and np.random.rand() < 0.2:
             freq = melody_notes[np.random.randint(0, len(melody_notes))]
-        amp = map_state_to_amp(state)
+        amp = map_dynamic_to_amp(state, dynamic)
         if not trigger_gates[gate_idx]:
             amp *= 0.3  # gated voices are quieter but still present
         pool.trigger(eid, bid, mid, freq, amp, float(state[2]))
         pool.render(outdata.T)
+
+        # Phase 3a: write stereo to self-sample ring buffer
+        ssb.write(outdata.T.copy())
 
         # 2. Multi-feature extraction
         mono = outdata.mean(axis=1)
@@ -923,6 +992,23 @@ def run(duration=None, device=None, verbose=False):
                     / (2.0 * len(mono))) if len(mono) > 0 else 0.0
         prev = feedback_state['centroid_history'][-1] if feedback_state['centroid_history'] else centroid
         flux = abs(centroid - prev)
+
+        # Phase 3b: Long-term feedback — feed every frame, tick every ~1s
+        ltfb.feed(centroid, flux, rms)
+        ltfb_frame_counter += 1
+        if ltfb_frame_counter >= ltfb.window_size:
+            ltfb_frame_counter = 0
+            lt_mod = ltfb.tick()
+            if lt_mod:
+                # lt_brightness (0=dark,1=bright) → rho (Lorenz attractor parameter)
+                if hasattr(chaos, 'rho'):
+                    target_rho = 15.0 + lt_mod.get('lt_brightness', 0.5) * 25.0
+                    chaos.rho += (target_rho - chaos.rho) * 0.02
+                # lt_activity (0=calm,1=busy) → dt (step size)
+                if hasattr(chaos, 'dt'):
+                    activity = lt_mod.get('lt_activity', 0.5)
+                    target_dt = 0.005 + activity * 0.04
+                    chaos.dt += (target_dt - chaos.dt) * 0.02
 
         # 3. Smooth histories (10-frame windows)
         feedback_state['centroid_history'].append(centroid)
@@ -956,6 +1042,9 @@ def run(duration=None, device=None, verbose=False):
         extra = coupling.read()
         outdata[:] *= (1.0 + extra * 0.3)
 
+        # Phase 3c: process through delay network (cross-feedback lines)
+        outdata[:] = delay_net.process(outdata.T).T
+
         # 8. Cold start: inject noise after 500ms silence
         feedback_state['silence_counter'] += frames
         if rms > 1e-4:
@@ -974,15 +1063,16 @@ def run(duration=None, device=None, verbose=False):
             feedback_state['sigma_drift'] = np.clip(feedback_state['sigma_drift'], -1.0, 1.0)
             chaos.sigma = np.clip(10.0 + feedback_state['sigma_drift'], 6.0, 15.0)
 
-    print("chaos-synth v0.2.0 [Phase 1]")
+    print("chaos-synth v0.3.0 [Phase 3 — Performance Handles + Full Integration]")
     print(f"  Chaos: {type(chaos).__name__}")
     print(f"  Manifold: {len(manifold.centroids)} centroids on [0,1]^3")
-
     print(f"  Pool: {pool.capacity} slots, max {pool.max_active} active")
     print(f"  Coupling: ON, 44100-sample ring buffer")
-    print(f"  Feedback: centroid+flux+zcr+rms -> sigma+dt+voices+coupling")
-    print(f"  CA: Rule 30, 64 cells, gate interval 4 (step=4)")
-    print(f"  LS: 3 rules, axiom=ABCB, interval 20")
+    print(f"  DelayNetwork: 4-line cross-feedback (150/225/337/506ms)")
+    print(f"  LongTermFeedback: 1s spectral averaging -> rho+dt")
+    print(f"  SelfSampleBuffer: 2s ring buffer")
+    print(f"  Performance: tonic={tonic:.2f} scale={scale} spread={pitch_spread:.2f} dyn={dynamic:.2f}")
+    print(f"  CA: Rule 30, 64 cells | LS: 3 rules, axiom=ABCB")
     print(f"  {SAMPLE_RATE}Hz / block {BLOCK_SIZE} / Ctrl+C to stop")
 
     stream = sd.OutputStream(

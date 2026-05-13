@@ -1,0 +1,29 @@
+name = "test_roundtrip"
+
+[chaos]
+type = "LorenzAttractor"
+sigma = 10.0
+rho = 28.0
+beta = 2.667
+dt = 0.01
+
+[manifold]
+n_centroids = 16
+
+[pool]
+capacity = 128
+max_active = 16
+
+[macros]
+material = 0.5
+density = 0.6
+mutation = 0.3
+coherence = 0.7
+feedback = 0.5
+energy = 0.4
+
+[coupling]
+enabled = true
+
+[delay_net]
+wet_mix = 0.3
