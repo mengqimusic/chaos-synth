@@ -668,7 +668,66 @@ class SelfSampleBuffer:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 9c. Spectral analysis
+# 9c. Delay Network — 4-line cross-feedback (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════
+
+class DelayNetwork:
+    """4 parallel delay lines with cross-feedback matrix (no-input mixer style)."""
+
+    def __init__(self, sr: int = SAMPLE_RATE):
+        self.sr = sr
+        # Delay times: 150ms, 225ms, 337ms, 506ms (prime-related ratios)
+        self.delays = [int(sr * t) for t in [0.150, 0.225, 0.337, 0.506]]
+        self.buffers = [np.zeros(d, dtype=np.float32) for d in self.delays]
+        self.positions = [0, 0, 0, 0]
+        # Cross-feedback matrix (4x4) — each line feeds into others
+        self.fb_matrix = np.array([
+            [0.0,  0.3,  0.15, 0.1],
+            [0.2,  0.0,  0.25, 0.15],
+            [0.1,  0.2,  0.0,  0.3],
+            [0.15, 0.1,  0.3,  0.0],
+        ], dtype=np.float32)
+        self.wet_mix = 0.3  # global wet/dry
+
+    def set_feedback(self, amount: float):
+        """Scale feedback matrix by amount (0-1)."""
+        self.fb_matrix *= amount / (np.abs(self.fb_matrix).max() + 1e-8)
+
+    def process(self, stereo_in: np.ndarray) -> np.ndarray:
+        """Process one block through delay network. Returns stereo."""
+        frames = stereo_in.shape[1]
+        mono = stereo_in.mean(axis=0)
+        out = np.zeros(frames, dtype=np.float32)
+
+        for f in range(frames):
+            sample_in = mono[f]
+            sample_out = 0.0
+
+            for i in range(4):
+                # Read from delay line
+                delayed = self.buffers[i][self.positions[i]]
+                # Write input + cross-feedback
+                fb_sum = 0.0
+                for j in range(4):
+                    if i != j:
+                        fb_sum += self.fb_matrix[i, j] * self.buffers[j][self.positions[j]]
+                self.buffers[i][self.positions[i]] = sample_in * 0.5 + fb_sum
+                # Advance position
+                self.positions[i] = (self.positions[i] + 1) % self.delays[i]
+                # Mix output
+                sample_out += delayed * 0.25
+
+            out[f] = sample_out * self.wet_mix
+
+        # Mix with original stereo
+        stereo_out = stereo_in.copy()
+        stereo_out[0] += out * 0.5
+        stereo_out[1] += out * 0.5
+        return np.clip(stereo_out, -1.0, 1.0).astype(np.float32)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9d. Spectral analysis
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
