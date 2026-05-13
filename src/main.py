@@ -225,8 +225,12 @@ def exciter_ringmod(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
     return sig * np.exp(-t * 200.0)
 
 
-def exciter_transient(freq: float, sr: int = SAMPLE_RATE) -> np.ndarray:
-    """#11: Transient snatch placeholder — will sample from output ring buffer (Phase 3)."""
+def exciter_transient(freq: float, sr: int = SAMPLE_RATE,
+                      self_sample: np.ndarray = None) -> np.ndarray:
+    """#11: Transient snatch from self-sampling ring buffer (Phase 3)."""
+    if self_sample is not None and len(self_sample) > 0:
+        # Use real self-sampled audio as the grain
+        return self_sample.astype(np.float32) * 0.8
     # Fallback: short burst of filtered noise
     buf = np.random.randn(128).astype(np.float32) * 0.2 * np.hanning(128).astype(np.float32)
     return buf
@@ -627,7 +631,44 @@ class CouplingField:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 9b. Spectral analysis
+# 9b. Self-Sampling Ring Buffer (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════
+
+class SelfSampleBuffer:
+    """2-second ring buffer recording stereo output. Exciter #11 reads from it."""
+
+    def __init__(self, duration_s: float = 2.0, sr: int = SAMPLE_RATE):
+        self.buffer = np.zeros((2, int(sr * duration_s)), dtype=np.float32)
+        self.pos = 0
+        self.length = self.buffer.shape[1]
+
+    def write(self, stereo: np.ndarray) -> None:
+        """Write a block of stereo audio into ring buffer."""
+        n = stereo.shape[1]
+        end = self.pos + n
+        if end <= self.length:
+            self.buffer[:, self.pos:end] = stereo
+        else:
+            split = self.length - self.pos
+            self.buffer[:, self.pos:] = stereo[:, :split]
+            self.buffer[:, :end - self.length] = stereo[:, split:]
+        self.pos = end % self.length
+
+    def snatch(self, length: int = 256) -> np.ndarray:
+        """Grab a recent transient from buffer. Returns mono float32."""
+        start = (self.pos - length) % self.length
+        if start + length <= self.length:
+            seg = self.buffer.mean(axis=0)[start:start + length].copy()
+        else:
+            seg = np.concatenate([
+                self.buffer.mean(axis=0)[start:],
+                self.buffer.mean(axis=0)[:length - (self.length - start)]
+            ])
+        return seg * np.hanning(length).astype(np.float32)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9c. Spectral analysis
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_spectral_centroid(signal: np.ndarray, sr: int) -> float:
