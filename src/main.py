@@ -687,12 +687,14 @@ class LSystem:
         self.string = axiom
         self.generation = 0
 
-    def iterate(self) -> str:
-        """Apply production rules in parallel. Returns new string."""
+    def iterate(self, max_len: int = 200) -> str:
+        """Apply production rules. Cap string at max_len."""
         result = []
-        for ch in self.string:
+        for ch in self.string[:max_len]:
             result.append(self.rules.get(ch, ch))
-        self.string = "".join(result)
+            if len(result) >= max_len:
+                break
+        self.string = "".join(result)[:max_len]
         self.generation += 1
         return self.string
 
