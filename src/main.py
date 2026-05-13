@@ -11,46 +11,95 @@ SAMPLE_RATE = 44100
 BLOCK_SIZE = 256
 
 # ═══════════════════════════════════════════════════════════════════════
-# 1. Logistic Map — x[n+1] = r * x[n] * (1 - x[n])
+# ═══════════════════════════════════════════════════════════════════════
+# 1. Chaos Engine - Logistic / Lorenz / Roessler (Phase 1)
 # ═══════════════════════════════════════════════════════════════════════
 
 class LogisticMap:
-    """1D chaotic map. r=3.7 gives deterministic chaos in (0,1)."""
+    """1D chaotic map. r=3.7 gives deterministic chaos. Returns array([x])."""
 
     def __init__(self, r: float = 3.7, x0: float = 0.5):
         self.r = r
-        self.x = x0
+        self._x = x0
 
-    def step(self) -> float:
-        """Advance one iteration, return x ∈ (0, 1)."""
-        self.x = self.r * self.x * (1.0 - self.x)
-        # Clamp away from fixed points at 0 and 1
-        if self.x < 1e-6:
-            self.x = 1e-6
-        elif self.x > 1.0 - 1e-6:
-            self.x = 1.0 - 1e-6
-        return self.x
+    def step(self) -> np.ndarray:
+        self._x = self.r * self._x * (1.0 - self._x)
+        if self._x < 1e-6:
+            self._x = 1e-6
+        elif self._x > 1.0 - 1e-6:
+            self._x = 1.0 - 1e-6
+        return np.array([self._x], dtype=np.float32)
 
 
+class LorenzAttractor:
+    """3D Lorenz attractor. Returns array([x, y, z]) normalized to [0,1]."""
+
+    def __init__(self, sigma=10.0, rho=28.0, beta=2.667, dt=0.01):
+        self.sigma, self.rho, self.beta, self.dt = sigma, rho, beta, dt
+        self.x, self.y, self.z = 1.0, 1.0, 1.0
+
+    def step(self) -> np.ndarray:
+        dx = self.sigma * (self.y - self.x)
+        dy = self.x * (self.rho - self.z) - self.y
+        dz = self.x * self.y - self.beta * self.z
+        self.x += dx * self.dt
+        self.y += dy * self.dt
+        self.z += dz * self.dt
+        return np.array([
+            np.clip((self.x + 20.0) / 40.0, 0, 1),
+            np.clip((self.y + 25.0) / 50.0, 0, 1),
+            np.clip(self.z / 50.0, 0, 1),
+        ], dtype=np.float32)
+
+
+class RoesslerAttractor:
+    """3D Roessler attractor. Returns array([x, y, z]) normalized to [0,1]."""
+
+    def __init__(self, a=0.2, b=0.2, c=5.7, dt=0.03):
+        self.a, self.b, self.c, self.dt = a, b, c, dt
+        self.x, self.y, self.z = 1.0, 1.0, 1.0
+
+    def step(self) -> np.ndarray:
+        dx = -self.y - self.z
+        dy = self.x + self.a * self.y
+        dz = self.b + self.z * (self.x - self.c)
+        self.x += dx * self.dt
+        self.y += dy * self.dt
+        self.z += dz * self.dt
+        return np.array([
+            np.clip((self.x + 10.0) / 25.0, 0, 1),
+            np.clip((self.y + 10.0) / 25.0, 0, 1),
+            np.clip(self.z / 25.0, 0, 1),
+        ], dtype=np.float32)
+
+
+CHAOS_ENGINES = {
+    'logistic': LogisticMap,
+    'lorenz': LorenzAttractor,
+    'roessler': RoesslerAttractor,
+}
 # ═══════════════════════════════════════════════════════════════════════
-# 2. 1D Voronoi Manifold — 4 centroids on [0,1]
+# 2. 3D Voronoi Manifold — 16 centroids on [0,1]³
 # ═══════════════════════════════════════════════════════════════════════
 
 class ManifoldMapper:
-    """1D Voronoi tessellation: nearest-centroid → (exciter, body) combo."""
+    """3D Voronoi tessellation: nearest-centroid → (exciter, body, mod)."""
 
-    def __init__(self):
-        self.centroids = np.array([0.125, 0.375, 0.625, 0.875], dtype=np.float32)
-        self.combos = [
-            (0, 0),  # c0: sine + dry
-            (1, 1),  # c1: noise + modal
-            (4, 2),  # c2: click + comb
-            (0, 2),  # c3: sine + comb
-        ]
+    def __init__(self, n_centroids: int = 16, seed: int = 42):
+        rng = np.random.RandomState(seed)
+        self.centroids = rng.rand(n_centroids, 3).astype(np.float32)
+        # Assign combos spread across module space
+        self.combos = []
+        for i in range(n_centroids):
+            e = i % 8   # exciter 0-7
+            b = (i // 2) % 6  # body 0-5
+            m = (i // 4) % 4  # modulator 0-3
+            self.combos.append((e, b, m))
 
-    def find_nearest(self, x: float) -> tuple:
-        """Return (exciter_id, body_id) for centroid nearest to x."""
-        idx = int(np.argmin(np.abs(self.centroids - x)))
+    def find_nearest(self, point: np.ndarray) -> tuple:
+        """Return (exciter_id, body_id, modulator_id)."""
+        dists = np.sum((self.centroids - point.astype(np.float32)) ** 2, axis=1)
+        idx = int(np.argmin(dists))
         return self.combos[idx]
 
 
@@ -198,8 +247,8 @@ class VoicePool:
     def _active_count(self) -> int:
         return sum(1 for v in self.voices if v['active'])
 
-    def trigger(self, exciter_id: int, body_id: int, freq: float,
-                amp: float, chaos_x: float) -> None:
+    def trigger(self, exciter_id: int, body_id: int, modulator_id: int,
+                freq: float, amp: float, chaos_x: float) -> None:
         """Spawn a new voice. Steals oldest if at max_active."""
         if self._active_count() >= self.max_active:
             oldest_i, oldest_t = 0, float('inf')
@@ -216,7 +265,7 @@ class VoicePool:
         # Render the full grain: exciter → body → modulator
         efn = EXCITERS.get(exciter_id, exciter_sine_impulse)
         bfn = BODIES.get(body_id, body_dry)
-        mfn = MODULATORS.get(0, modulator_static)
+        mfn = MODULATORS.get(modulator_id, modulator_static)
         grain = mfn(bfn(efn(freq, SAMPLE_RATE), freq, SAMPLE_RATE))
         grain = np.clip(grain * amp, -1.0, 1.0).astype(np.float32)
 
@@ -253,18 +302,18 @@ class VoicePool:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 8. Parameter Mapping
+# ═══════════════════════════════════════════════════════════════════════
+# 8. Parameter Mapping (3D state aware)
 # ═══════════════════════════════════════════════════════════════════════
 
-def map_x_to_freq(x: float) -> float:
-    """Map x ∈ [0,1] → 55 Hz – 1760 Hz (A1–A6, 5 octaves)."""
-    return 55.0 * (2.0 ** (x * 5.0))
+def map_state_to_freq(state: np.ndarray) -> float:
+    """Map state[0] in [0,1] to 55 Hz - 1760 Hz (A1-A6, 5 octaves)."""
+    return 55.0 * (2.0 ** (float(state[0]) * 5.0))
 
 
-def map_x_to_amp(x: float) -> float:
-    """Map x ∈ [0,1] → amplitude 0.05 – 0.5."""
-    return 0.05 + x * 0.45
-
+def map_state_to_amp(state: np.ndarray) -> float:
+    """Map state[1] in [0,1] to amplitude 0.05 - 0.5."""
+    return 0.05 + float(state[1]) * 0.45
 
 # ═══════════════════════════════════════════════════════════════════════
 # 9. Spectral centroid & audio callback (sounddevice)
@@ -292,9 +341,9 @@ def run(duration=None, device=None):
     """Launch the synth. duration=None runs forever (Ctrl+C to stop)."""
     import sounddevice as sd
 
-    logistic = LogisticMap(r=3.7, x0=0.5)
-    manifold = ManifoldMapper()
-    pool = VoicePool(capacity=128, max_active=8)
+    chaos = LorenzAttractor()
+    manifold = ManifoldMapper(n_centroids=16)
+    pool = VoicePool(capacity=128, max_active=16)
 
     feedback_state = {
         'centroid_history': [],
@@ -305,24 +354,32 @@ def run(duration=None, device=None):
     def audio_callback(outdata, frames, time_info, status):
         outdata.fill(0.0)
 
-        x = logistic.step()
-        exciter_id, body_id = manifold.find_nearest(x)
-        freq = map_x_to_freq(x)
-        amp = map_x_to_amp(x)
-        pool.trigger(exciter_id, body_id, freq, amp, x)
+        state = chaos.step()
+        exciter_id, body_id, modulator_id = manifold.find_nearest(state)
+        freq = map_state_to_freq(state)
+        amp = map_state_to_amp(state)
+        pool.trigger(exciter_id, body_id, modulator_id, freq, amp, float(state[2]))
         pool.render(outdata.T)
 
         mono = outdata.mean(axis=1)
         centroid = compute_spectral_centroid(mono, SAMPLE_RATE)
+        rms = np.sqrt(np.mean(mono ** 2))
+        zcr = float(np.sum(np.abs(np.diff(np.sign(mono)))) / (2.0 * len(mono))) if len(mono) > 0 else 0.0
 
         feedback_state['centroid_history'].append(centroid)
         if len(feedback_state['centroid_history']) > 10:
             feedback_state['centroid_history'].pop(0)
 
         avg_centroid = np.mean(feedback_state['centroid_history'])
-        # Map avg centroid to r: dark(~500Hz)→3.5, neutral(~2500Hz)→3.7, bright(~5000Hz)→3.95
-        dr = np.clip((avg_centroid / 2500.0 - 1.5) * 0.25, -0.2, 0.25)
-        logistic.r = np.clip(3.5 + dr, 3.5, 3.95)
+        # Feedback to Lorenz sigma (affects orbit shape)
+        # bright sound → sigma↓ (calmer), dark sound → sigma↑ (more chaotic)
+        if hasattr(chaos, 'sigma'):
+            target_sigma = 6.0 + (1.0 - avg_centroid / 5000.0) * 9.0
+            chaos.sigma += (target_sigma - chaos.sigma) * 0.01
+
+        # Feedback to manifold density via root mean square
+        # low RMS → more density, high RMS → less
+        density_target = max(100, int(200 - rms * 5000))
 
         feedback_state['silence_counter'] += frames
         rms = np.sqrt(np.mean(mono ** 2))
@@ -335,17 +392,17 @@ def run(duration=None, device=None):
             outdata[:, 1] += noise
             feedback_state['silence_counter'] = 0
 
-        # Slow r drift: prevent lock-in at any single value
-        # Adds ~0.0001 per second of random walk, bounded
-        if 'r_drift' not in feedback_state:
-            feedback_state['r_drift'] = 0.0
-        feedback_state['r_drift'] += np.random.randn() * 0.00002
-        feedback_state['r_drift'] = np.clip(feedback_state['r_drift'], -0.05, 0.05)
-        logistic.r = np.clip(logistic.r + feedback_state['r_drift'], 3.5, 3.95)
+        # Slow attractor parameter drift (works for any chaos engine)
+        if hasattr(chaos, 'sigma'):
+            if 'sigma_drift' not in feedback_state:
+                feedback_state['sigma_drift'] = 0.0
+            feedback_state['sigma_drift'] += np.random.randn() * 0.002
+            feedback_state['sigma_drift'] = np.clip(feedback_state['sigma_drift'], -1.0, 1.0)
+            chaos.sigma = np.clip(10.0 + feedback_state['sigma_drift'], 6.0, 15.0)
 
-    print(f"chaos-synth v0.1.0 [Phase 0 MVP]")
-    print(f"  Logistic: r={logistic.r:.2f}")
-    print(f"  Manifold: 4 centroids, combos={manifold.combos}")
+    print(f"chaos-synth v0.2.0 [Phase 1 - Lorenz + 3D Manifold]")
+    print(f"  Chaos: {type(chaos).__name__}")
+    print(f"  Manifold: {len(manifold.centroids)} centroids on [0,1]³")
     print(f"  Pool: {pool.capacity} slots, max {pool.max_active} active")
     print(f"  S/R: {SAMPLE_RATE}Hz, block: {BLOCK_SIZE}")
     print(f"  Ctrl+C to stop")
