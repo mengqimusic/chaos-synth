@@ -717,7 +717,7 @@ class LSystem:
 # 10. Entry point — audio callback + feedback + coupling
 # ═══════════════════════════════════════════════════════════════════════
 
-def run(duration=None, device=None):
+def run(duration=None, device=None, verbose=False):
     """Launch the synth. duration=None runs forever (Ctrl+C to stop)."""
     import sounddevice as sd
 
@@ -860,6 +860,9 @@ def run(duration=None, device=None):
             else:
                 while True:
                     sd.sleep(1000)
+                    if verbose:
+                        stats = f"\r  voices:{pool._active_count()}/{pool.max_active} sigma:{chaos.sigma:.1f} rc:{coupling.read():.3f}  "
+                        print(stats, end='', flush=True)
     except KeyboardInterrupt:
         print('\nStopped.')
 
