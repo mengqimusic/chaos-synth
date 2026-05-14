@@ -41,7 +41,11 @@ _params = {
     'pos_e': 0.5,         # exciter axis
     'pos_b': 0.5,         # body axis
     'pos_m': 0.5,         # modulator axis
-    'pos_spread': 0.1,    # shared random jitter
+    'pos_spread': 0.1,
+    # Macros (E/B/M)
+    'bite': 0.5, 'color': 0.5,
+    'ring': 0.5, 'body_size': 0.5,
+    'warp': 0.5, 'grit': 0.5,
     # Spread
     'pitch_spread': 2.0,  # semitones
     'pan_spread': 0.5,
@@ -137,7 +141,10 @@ def _audio_callback(outdata, frames, time_info, status):
         amp = 0.3 / max(1.0, n_grains ** 0.5)
 
         # Trigger voice
-        _pool.trigger(eid, bid, mid, pfreq, amp, 0.5)
+        _pool.trigger(eid, bid, mid, pfreq, amp, 0.5,
+                       bite=p['bite'], color=p['color'],
+                       ring=p['ring'], body_size=p['body_size'],
+                       warp=p['warp'], grit=p['grit'])
 
         # Override grain: truncate + self-sample mix
         for v in _pool.voices:
@@ -237,6 +244,18 @@ def build_ui():
         with dpg.group(horizontal=True):
             _slider("pitch_spread", "Pitch +-", 0, 24, 2, "%.0f sem")
             _slider("pan_spread", "Pan", 0, 1, 0.5, "%.2f")
+
+        dpg.add_spacer(height=6)
+
+        # ── MACRO ──
+        dpg.add_text("MACRO  (E: Bite/Color  B: Ring/Body  M: Warp/Grit)", color=(255, 180, 100))
+        with dpg.group(horizontal=True):
+            _slider("bite", "Bite", 0, 1, 0.5, "%.2f")
+            _slider("color", "Color", 0, 1, 0.5, "%.2f")
+            _slider("ring", "Ring", 0, 1, 0.5, "%.2f")
+            _slider("body_size", "Body", 0, 1, 0.5, "%.2f")
+            _slider("warp", "Warp", 0, 1, 0.5, "%.2f")
+            _slider("grit", "Grit", 0, 1, 0.5, "%.2f")
 
         dpg.add_spacer(height=6)
 
