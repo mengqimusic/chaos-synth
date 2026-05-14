@@ -144,6 +144,14 @@ def _audio_callback(outdata, frames, time_info, status):
             if v['active'] and v['age'] == 0:
                 grain = v['buffer']
                 g_slice = grain[:psize_samples]
+                # If requested size > grain length, extend with decay tail
+                if psize_samples > len(g_slice):
+                    tail_len = psize_samples - len(g_slice)
+                    last_val = g_slice[-1] if len(g_slice) > 0 else 0.0
+                    decay_tau = int(SAMPLE_RATE * 0.02)  # 20ms decay
+                    decay = np.exp(-np.arange(tail_len) / decay_tau).astype(np.float32)
+                    tail = last_val * decay
+                    g_slice = np.concatenate([g_slice, tail])
                 if p['feedback'] > 0.001:
                     ssb_grain = _ssb.snatch(length=len(g_slice))
                     mix = min(len(g_slice), len(ssb_grain))
