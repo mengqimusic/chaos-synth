@@ -199,14 +199,16 @@ def body_nonlinear(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, r
 def body_freeze(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, ring: float = 0.5, body_size: float = 0.5) -> np.ndarray:
 
     """#5: Granular freeze. Repeat first 64 samples, 3 iterations."""
-    loop_len = int(16 + body_size * 112)
+    loop_len = int(16 + body_size * 48)  # 16-64
     loop = excitation[:min(loop_len, len(excitation))].copy()
     out = excitation.copy()
-    n_iters = int(1 + ring * 7)
+    n_iters = int(1 + ring * 5)  # 1-6 iterations
     for i in range(n_iters):
-        start = min(len(out), len(loop))
-        end = min(len(out), start + 64)
-        out[start:end] += loop[:end - start] * 0.3
+        start = min(len(out), i + 1)
+        end = min(len(out), start + len(loop))
+        if end > start:
+            seg = loop[:end - start]
+            out[start:end] += seg * 0.3
     return out
 
 def body_waveguide(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, ring: float = 0.5, body_size: float = 0.5) -> np.ndarray:
@@ -217,7 +219,7 @@ def body_waveguide(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, r
     out = excitation.copy().astype(np.float32)
     for i in range(delay, length):
         damp = 0.99 - ring * 0.49
-    out[i] += (out[i-delay] - out[i-delay+1] if i-delay+1 < length else 0) * 0.5 * damp
+        out[i] += (out[i-delay] - out[i-delay+1] if i-delay+1 < length else 0) * 0.5 * damp
     return out
 
 def body_saturation(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, ring: float = 0.5, body_size: float = 0.5) -> np.ndarray:
@@ -231,15 +233,12 @@ def body_saturation(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, 
 def body_blur(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, ring: float = 0.5, body_size: float = 0.5) -> np.ndarray:
 
     """#8: Spectral blur — phase randomization in FFT domain."""
-    win_size = int(512 - body_size * 448)
-    padded = np.zeros(win_size, dtype=np.float32)
-    padded[:len(excitation)] = excitation
-    fx = np.fft.rfft(padded).astype(np.complex64)
+    fx = np.fft.rfft(excitation).astype(np.complex64)
     mag = np.abs(fx)
     random_phase = np.exp(1j * np.random.rand(len(mag)) * 2 * np.pi).astype(np.complex64)
-    blurred = np.fft.irfft(mag * random_phase, n=win_size).astype(np.float32)
-    mixed = excitation * (1-ring) + blurred[:len(excitation)] * ring
-    return mixed.astype(np.float32)
+    blurred = np.fft.irfft(mag * random_phase, n=len(excitation)).astype(np.float32)
+    ring_mix = ring  # 0=original, 1=fully blurred
+    return (excitation * (1-ring_mix) + blurred * ring_mix).astype(np.float32)
 
 def body_pshift_fb(excitation: np.ndarray, freq: float, sr: int = SAMPLE_RATE, ring: float = 0.5, body_size: float = 0.5) -> np.ndarray:
 
