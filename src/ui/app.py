@@ -192,6 +192,15 @@ def _audio_callback(outdata, frames, time_info, status):
         bfn = BODIES.get(bid, BODIES[0])
         grain = bfn(efn(freq, SAMPLE_RATE), freq, SAMPLE_RATE)
 
+    # Feedback: mix self-sample buffer into main voice (after body, before modulator)
+    ssb_length = min(256, len(grain))
+    ssb_grain = _ssb.snatch(length=ssb_length)
+    if len(ssb_grain) != len(grain):
+        min_len = min(len(grain), len(ssb_grain))
+        grain = grain[:min_len] * (1.0 - feedback * 0.6) + ssb_grain[:min_len] * feedback * 0.6
+    else:
+        grain = grain * (1.0 - feedback * 0.6) + ssb_grain * feedback * 0.6
+
     # Apply modulator
     if mid == 1:
         grain = _mod_tremolo(grain)
@@ -226,7 +235,45 @@ def _audio_callback(outdata, frames, time_info, status):
         efreq = freq
         if not st['trigger_gates'][int(extra_state[2] * 8) % 8]:
             eamp *= max(0.05, 1.0 - density)
+
+        if eeid == 11:
+            egrain = BODIES.get(ebid, lambda x, f: x)(
+                exciter_transient(efreq, SAMPLE_RATE, _ssb.snatch()),
+                efreq, SAMPLE_RATE)
+        else:
+            efn2 = EXCITERS.get(eeid, EXCITERS[0])
+            bfn2 = BODIES.get(ebid, BODIES[0])
+            egrain = bfn2(efn2(efreq, SAMPLE_RATE), efreq, SAMPLE_RATE)
+
+        # Feedback: mix self-sample buffer into extra voice (after body, before modulator)
+        ssb_len2 = min(256, len(egrain))
+        ssb_grain2 = _ssb.snatch(length=ssb_len2)
+        if len(ssb_grain2) != len(egrain):
+            min_len2 = min(len(egrain), len(ssb_grain2))
+            egrain = egrain[:min_len2] * (1.0 - feedback * 0.6) + ssb_grain2[:min_len2] * feedback * 0.6
+        else:
+            egrain = egrain * (1.0 - feedback * 0.6) + ssb_grain2 * feedback * 0.6
+
+        # Apply modulator
+        if emid == 1:
+            egrain = _mod_tremolo(egrain)
+        elif emid == 2:
+            egrain = _mod_vibrato(egrain)
+        elif emid == 3:
+            egrain = _mod_phase_dist(egrain)
+        elif emid == 4:
+            egrain = _mod_ringmod(egrain)
+        elif emid == 5:
+            egrain = _mod_bitcrush(egrain)
+        elif emid == 6:
+            egrain = _mod_stereo_width(egrain)
+
+        egrain = np.clip(egrain * eamp, -1.0, 1.0).astype(np.float32)
+
         _pool.trigger(eeid, ebid, emid, efreq, eamp, float(extra_state[2]))
+        for v in _pool.voices:
+            if v['active'] and v['age'] == 0:
+                v['buffer'][:len(egrain)] = egrain[:len(v['buffer'])]
 
     # ── 4. Render voice pool ──────────────────────────────────────────
     _pool.render(outdata.T)
@@ -306,7 +353,8 @@ def _audio_callback(outdata, frames, time_info, status):
     extra = _coupling.read()
     outdata[:] *= (1.0 + extra * coupling_gain)
 
-    # ── 13. Delay network (feedback-controlled wet mix) ───────────────
+    # ── 13. Delay network (feedback-controlled wet mix + cross-feedback) ──
+    _delay_net.set_feedback(feedback)
     _delay_net.wet_mix = 0.05 + feedback * 0.7
     outdata[:] = _delay_net.process(outdata.T).T
 
