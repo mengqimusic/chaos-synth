@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""chaos-synth — Granular Synthesis Engine (Phase 4)
+"""chaos-synth — Granular Synthesis Engine (Phase 4b)
 
-Classic granular synthesis: manual parameters + LFO modulation + Timbre Map.
-2520 exciter×body×modulator combos selectable via 8 arrangement maps.
-Direct control — no chaos engine, no Voronoi, no feedback analysis.
+3D timbre space: Pos E→exciter, Pos B→body, Pos M→modulator.
+MIDI pitch, 6 LFOs (3 dedicated position + 3 general purpose).
 
 Run: python src/ui/app.py
 """
@@ -11,10 +10,9 @@ Run: python src/ui/app.py
 import sys, os, threading
 import numpy as np
 
-# ── Import engine ──────────────────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from main import (
-    SAMPLE_RATE, BLOCK_SIZE, TimbreMap, LFO,
+    SAMPLE_RATE, BLOCK_SIZE, LFO,
     VoicePool, SelfSampleBuffer, DelayNetwork,
     EXCITERS, BODIES,
 )
@@ -23,38 +21,48 @@ import dearpygui.dearpygui as dpg
 import sounddevice as sd
 
 # ═══════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════
+def midi_to_hz(note):
+    """MIDI note number → Hz. 69 = A4 = 440Hz."""
+    return 440.0 * (2.0 ** ((note - 69.0) / 12.0))
+
+# ═══════════════════════════════════════════════════════════════════════
 # Shared State
 # ═══════════════════════════════════════════════════════════════════════
 _params_lock = threading.Lock()
 _params = {
     # Particle
-    'rate': 20.0,           # grains per second
-    'pitch': 440.0,         # base frequency Hz
-    'size': 0.05,           # grain length seconds
-    'feedback': 0.3,        # self-sample mix + delay
+    'rate': 20.0,
+    'pitch': 60,          # MIDI note (C4)
+    'size': 0.1,          # seconds
+    'feedback': 0.3,
+    # Position (3D timbre)
+    'pos_e': 0.5,         # exciter axis
+    'pos_b': 0.5,         # body axis
+    'pos_m': 0.5,         # modulator axis
+    'pos_spread': 0.1,    # shared random jitter
     # Spread
-    'pitch_spread': 0.1,    # ±octaves
-    'pan_spread': 0.5,      # 0=center, 1=full width
-    'position_spread': 0.1, # combo position jitter
-    # Timbre Map
-    'timbre_map': 'Gradual', # map name
-    'position': 0.5,        # 0→1 scan through map
-    # LFO targets
+    'pitch_spread': 2.0,  # semitones
+    'pan_spread': 0.5,
+    # POS LFOs (dedicated to position axes)
+    'poslfo_e_wave': 'Sine', 'poslfo_e_rate': 0.3, 'poslfo_e_depth': 0.0,
+    'poslfo_b_wave': 'Sine', 'poslfo_b_rate': 0.4, 'poslfo_b_depth': 0.0,
+    'poslfo_m_wave': 'Sine', 'poslfo_m_rate': 0.5, 'poslfo_m_depth': 0.0,
+    # General LFOs
     'lfo0_target': 'Pitch', 'lfo0_wave': 'Sine', 'lfo0_rate': 0.5, 'lfo0_depth': 0.0,
     'lfo1_target': 'Size',  'lfo1_wave': 'Sine', 'lfo1_rate': 0.3, 'lfo1_depth': 0.0,
-    'lfo2_target': 'Position','lfo2_wave': 'Sine','lfo2_rate': 0.2, 'lfo2_depth': 0.0,
+    'lfo2_target': 'Pan',   'lfo2_wave': 'Sine', 'lfo2_rate': 0.2, 'lfo2_depth': 0.0,
 }
 
-# ── Engine instances ───────────────────────────────────────────────────
-_timbre_map = TimbreMap()
-_pool = VoicePool(capacity=128, max_active=32)
+# Engine instances
+_pool = VoicePool(capacity=128, max_active=40)
 _ssb = SelfSampleBuffer(duration_s=2.0)
 _delay_net = DelayNetwork()
+_pos_lfos = [LFO("PE"), LFO("PB"), LFO("PM")]
 _lfos = [LFO("LFO1"), LFO("LFO2"), LFO("LFO3")]
 
-# ── Callback state (audio thread only) ─────────────────────────────────
 _cb_state = {'accumulator': 0.0}
-
 _audio_stream = None
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -70,17 +78,25 @@ def _audio_callback(outdata, frames, time_info, status):
 
     dt = frames / SAMPLE_RATE
 
-    # ── Sync LFO params + tick ─────────────────────────────────────────
+    # ── Sync + tick POS LFOs (fixed targets: pos_e, pos_b, pos_m) ─────
+    pos_lfo_vals = []
+    for i, lfo in enumerate(_pos_lfos):
+        axis = ['e', 'b', 'm'][i]
+        lfo.waveform = p[f'poslfo_{axis}_wave']
+        lfo.rate = p[f'poslfo_{axis}_rate']
+        lfo.depth = p[f'poslfo_{axis}_depth']
+        lfo.tick(dt)
+        pos_lfo_vals.append(lfo.value * lfo.depth if lfo.depth > 0.001 else 0.0)
+
+    # ── Sync + tick general LFOs ───────────────────────────────────────
     for i, lfo in enumerate(_lfos):
-        key = f'lfo{i}'
-        # Only sync if depth > 0 (avoid sync overhead when LFO unused)
-        lfo.target = p[f'{key}_target']
-        lfo.waveform = p[f'{key}_wave']
-        lfo.rate = p[f'{key}_rate']
-        lfo.depth = p[f'{key}_depth']
+        lfo.target = p[f'lfo{i}_target']
+        lfo.waveform = p[f'lfo{i}_wave']
+        lfo.rate = p[f'lfo{i}_rate']
+        lfo.depth = p[f'lfo{i}_depth']
         lfo.tick(dt)
 
-    # ── Apply LFO to parameters ────────────────────────────────────────
+    # ── Apply general LFOs to parameters ───────────────────────────────
     def lfo_val(target):
         for lfo in _lfos:
             if lfo.target == target and lfo.depth > 0.001:
@@ -88,182 +104,170 @@ def _audio_callback(outdata, frames, time_info, status):
         return 0.0
 
     rate = max(1.0, p['rate'] * (1.0 + lfo_val('Rate')))
-    pitch = max(20.0, p['pitch'] * (1.0 + lfo_val('Pitch')))
-    size = max(0.003, min(0.5, p['size'] * (1.0 + lfo_val('Size'))))
-    position = np.clip(p['position'] + lfo_val('Position') * 0.5, 0.0, 1.0)
-    pan_spread_lfo = np.clip(p['pan_spread'] + lfo_val('Pan'), 0.0, 1.0)
+    pitch_midi = max(21.0, min(108.0, p['pitch'] + lfo_val('Pitch') * 24.0))
+    size = max(0.001, min(2.0, p['size'] * (1.0 + lfo_val('Size'))))
+    pan = np.clip(p['pan_spread'] + lfo_val('Pan'), 0.0, 1.0)
 
-    # ── How many grains this block? ────────────────────────────────────
+    # 3D position with dedicated LFOs
+    pos_e = np.clip(p['pos_e'] + pos_lfo_vals[0] * 0.5, 0.0, 1.0)
+    pos_b = np.clip(p['pos_b'] + pos_lfo_vals[1] * 0.5, 0.0, 1.0)
+    pos_m = np.clip(p['pos_m'] + pos_lfo_vals[2] * 0.5, 0.0, 1.0)
+
+    # ── Grains this block ──────────────────────────────────────────────
     _cb_state['accumulator'] += rate * dt
     n_grains = int(_cb_state['accumulator'])
     _cb_state['accumulator'] -= n_grains
 
     # ── Trigger grains ─────────────────────────────────────────────────
+    spread = p['pos_spread']
     for _ in range(n_grains):
-        # Position → TimbreMap combo
-        ppos = position + np.random.uniform(-p['position_spread'], p['position_spread'])
-        eid, bid, mid = _timbre_map.get_combo(np.clip(ppos, 0.0, 1.0))
+        # 3D position → combo
+        eid = int(np.clip(pos_e + np.random.uniform(-spread, spread), 0.0, 0.999) * 12)
+        bid = int(np.clip(pos_b + np.random.uniform(-spread, spread), 0.0, 0.999) * 10)
+        mid = int(np.clip(pos_m + np.random.uniform(-spread, spread), 0.0, 0.999) * 7)
 
-        # Pitch with spread
-        pfreq = pitch * (2.0 ** np.random.uniform(-p['pitch_spread'], p['pitch_spread']))
-        pfreq = np.clip(pfreq, 20.0, 12000.0)
+        # Pitch: MIDI + spread (semitones)
+        note = pitch_midi + np.random.uniform(-p['pitch_spread'], p['pitch_spread'])
+        pfreq = midi_to_hz(np.clip(note, 21.0, 120.0))
 
-        # Grain size in samples
+        # Size in samples
         psize_samples = max(4, int(size * SAMPLE_RATE))
 
-        # Amplitude (dynamic range based on voice count)
+        # Amplitude
         amp = 0.3 / max(1.0, n_grains ** 0.5)
 
-        # Trigger voice (VoicePool handles exciter→body→modulator internally)
+        # Trigger voice
         _pool.trigger(eid, bid, mid, pfreq, amp, 0.5)
 
-        # Override grain buffer: truncate to desired size + apply self-sample mix
+        # Override grain: truncate + self-sample mix
         for v in _pool.voices:
             if v['active'] and v['age'] == 0:
                 grain = v['buffer']
-                # Truncate to size
                 g_slice = grain[:psize_samples]
-                # Self-sample feedback mix
                 if p['feedback'] > 0.001:
                     ssb_grain = _ssb.snatch(length=len(g_slice))
                     mix = min(len(g_slice), len(ssb_grain))
                     g_slice = g_slice[:mix] * (1.0 - p['feedback'] * 0.6) + ssb_grain[:mix] * p['feedback'] * 0.6
-                # Write back (pad if needed)
                 v['buffer'][:len(g_slice)] = g_slice
                 if len(g_slice) < len(v['buffer']):
                     v['buffer'][len(g_slice):] = 0.0
                 v['duration'] = len(g_slice)
-                # Store pan for per-voice stereo spread
-                v['pan'] = 0.5 + np.random.uniform(-1.0, 1.0) * pan_spread_lfo * 0.5
+                # Per-voice pan
+                v['pan'] = 0.5 + np.random.uniform(-1.0, 1.0) * pan * 0.5
                 break
 
-    # ── Render pool with per-voice pan ─────────────────────────────────
+    # ── Render pool + effects ──────────────────────────────────────────
     _pool.render(outdata.T)
-
-    # ── Self-sample write + delay ──────────────────────────────────────
     _ssb.write(outdata.T.copy())
     _delay_net.set_feedback(p['feedback'])
     _delay_net.wet_mix = 0.05 + p['feedback'] * 0.7
     outdata[:] = _delay_net.process(outdata.T).T
 
 # ═══════════════════════════════════════════════════════════════════════
-# Audio Stream Control
+# Audio Stream
 # ═══════════════════════════════════════════════════════════════════════
 def _start_audio():
     global _audio_stream
     _audio_stream = sd.OutputStream(
-        samplerate=SAMPLE_RATE,
-        blocksize=BLOCK_SIZE,
-        channels=2,
-        dtype='float32',
-        callback=_audio_callback,
-    )
+        samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
+        channels=2, dtype='float32', callback=_audio_callback)
     _audio_stream.start()
-    print("Audio stream started.")
+    print("Audio started.")
 
 def _stop_audio():
     global _audio_stream
-    if _audio_stream is not None:
-        _audio_stream.stop()
-        _audio_stream.close()
-        _audio_stream = None
-        print("Audio stream stopped.")
+    if _audio_stream:
+        _audio_stream.stop(); _audio_stream.close(); _audio_stream = None
 
 # ═══════════════════════════════════════════════════════════════════════
-# UI Callbacks
+# UI
 # ═══════════════════════════════════════════════════════════════════════
-def _on_param_change(sender, app_data, user_data):
+def _on_change(sender, app_data, user_data):
     with _params_lock:
         _params[user_data] = app_data
 
-def _on_map_change(sender, app_data):
-    _timbre_map.set_map(app_data)
-    with _params_lock:
-        _params['timbre_map'] = app_data
+LFO_TARGETS = ['Pitch', 'Size', 'Rate', 'Pan', 'Pitch Spread', 'Pos Spread']
+LFO_WAVES = LFO.WAVEFORMS
 
-# ═══════════════════════════════════════════════════════════════════════
-# Parameter definitions
-# ═══════════════════════════════════════════════════════════════════════
-LFO_TARGETS = ['Pitch', 'Size', 'Rate', 'Position', 'Pan']
-LFO_WAVES = LFO.WAVEFORMS  # ['Sine', 'Triangle', 'Square', 'Saw', 'Random']
-
-# ═══════════════════════════════════════════════════════════════════════
-# UI Layout
-# ═══════════════════════════════════════════════════════════════════════
 def build_ui():
     dpg.create_context()
 
-    with dpg.window(label="Chaos Synth — Granular", width=920, height=620,
-                    tag="main_window"):
+    with dpg.window(label="Chaos Synth — Granular", width=960, height=700):
+
         # ── PARTICLE ──
         dpg.add_text("PARTICLE", color=(255, 200, 100))
         with dpg.group(horizontal=True):
-            _add_slider("rate", "Rate", 1, 200, 20, "%.0f")
-            _add_slider("pitch", "Pitch", 20, 8000, 440, "%.0f Hz")
-            _add_slider("size", "Size", 0.003, 0.5, 0.05, "%.3f s")
-            _add_slider("feedback", "Feedback", 0, 1, 0.3, "%.2f")
+            _slider("rate", "Rate", 1, 200, 20, "%.0f/s")
+            _slider("pitch", "Pitch", 21, 108, 60, "%.0f")
+            _slider("size", "Size", 0.001, 2.0, 0.1, "%.3fs")
+            _slider("feedback", "Feedback", 0, 1, 0.3, "%.2f")
 
-        dpg.add_spacer(height=8)
+        dpg.add_spacer(height=6)
+
+        # ── POSITION (3D) ──
+        dpg.add_text("POSITION  (E=exciter  B=body  M=modulator)", color=(200, 150, 255))
+        with dpg.group(horizontal=True):
+            _slider("pos_e", "Pos E", 0, 1, 0.5, "%.3f")
+            _slider("pos_b", "Pos B", 0, 1, 0.5, "%.3f")
+            _slider("pos_m", "Pos M", 0, 1, 0.5, "%.3f")
+            _slider("pos_spread", "Spread", 0, 1, 0.1, "%.2f")
+
+        dpg.add_spacer(height=6)
 
         # ── SPREAD ──
         dpg.add_text("SPREAD", color=(100, 200, 255))
         with dpg.group(horizontal=True):
-            _add_slider("pitch_spread", "Pitch ±", 0, 2, 0.1, "%.1f oct")
-            _add_slider("pan_spread", "Pan", 0, 1, 0.5, "%.2f")
-            _add_slider("position_spread", "Pos ±", 0, 1, 0.1, "%.2f")
+            _slider("pitch_spread", "Pitch +-", 0, 24, 2, "%.0f sem")
+            _slider("pan_spread", "Pan", 0, 1, 0.5, "%.2f")
 
-        dpg.add_spacer(height=8)
+        dpg.add_spacer(height=6)
 
-        # ── TIMBRE MAP ──
-        dpg.add_text("TIMBRE MAP", color=(200, 150, 255))
-        with dpg.group(horizontal=True):
-            dpg.add_combo(tag="timbre_map_combo", label="Map",
-                          items=_timbre_map.map_names, default_value="Gradual",
-                          callback=_on_map_change, width=130)
-            dpg.add_slider_float(tag="position_slider", label="Position",
-                                 default_value=0.5, min_value=0.0, max_value=1.0,
-                                 callback=_on_param_change, user_data="position",
-                                 width=300, height=60, vertical=True)
+        # ── POS LFOs ──
+        dpg.add_text("POS LFO  (E / B / M)", color=(150, 255, 150))
+        for i, axis in enumerate(['e', 'b', 'm']):
+            with dpg.group(horizontal=True):
+                dpg.add_text(f"  {axis.upper()}:")
+                dpg.add_combo(tag=f"poslfo_{axis}_wave", items=LFO_WAVES,
+                              default_value="Sine", width=75,
+                              callback=_on_change, user_data=f"poslfo_{axis}_wave")
+                _lfo_slider(f"poslfo_{axis}_rate", 0.05, 10, 0.3)
+                _lfo_slider(f"poslfo_{axis}_depth", 0, 1, 0.0)
 
-        dpg.add_spacer(height=8)
+        dpg.add_spacer(height=6)
 
-        # ── LFOs ──
+        # ── General LFOs ──
         dpg.add_text("LFO", color=(150, 255, 150))
         for i in range(3):
             with dpg.group(horizontal=True):
                 dpg.add_text(f"LFO{i+1}")
                 dpg.add_combo(tag=f"lfo{i}_target", items=LFO_TARGETS,
-                              default_value=_params[f'lfo{i}_target'], width=80,
-                              callback=_on_lfo_change, user_data=f'lfo{i}_target')
+                              default_value=_params[f'lfo{i}_target'], width=90,
+                              callback=_on_change, user_data=f'lfo{i}_target')
                 dpg.add_combo(tag=f"lfo{i}_wave", items=LFO_WAVES,
-                              default_value=_params[f'lfo{i}_wave'], width=80,
-                              callback=_on_lfo_change, user_data=f'lfo{i}_wave')
-                dpg.add_slider_float(tag=f"lfo{i}_rate", label="Rate",
-                                     default_value=_params[f'lfo{i}_rate'],
-                                     min_value=0.05, max_value=20.0,
-                                     callback=_on_lfo_change, user_data=f'lfo{i}_rate',
-                                     width=80, height=40, vertical=True)
-                dpg.add_slider_float(tag=f"lfo{i}_depth", label="Depth",
-                                     default_value=_params[f'lfo{i}_depth'],
-                                     min_value=0.0, max_value=1.0,
-                                     callback=_on_lfo_change, user_data=f'lfo{i}_depth',
-                                     width=80, height=40, vertical=True)
+                              default_value="Sine", width=75,
+                              callback=_on_change, user_data=f'lfo{i}_wave')
+                _lfo_slider(f"lfo{i}_rate", 0.05, 20, _params[f'lfo{i}_rate'])
+                _lfo_slider(f"lfo{i}_depth", 0, 1, _params[f'lfo{i}_depth'])
 
-    dpg.create_viewport(title="Chaos Synth — Granular", width=940, height=660)
+        dpg.add_spacer(height=6)
+
+    dpg.create_viewport(title="Chaos Synth — Granular", width=980, height=730)
     dpg.setup_dearpygui()
     dpg.show_viewport()
 
-def _add_slider(key, label, vmin, vmax, default, fmt):
+def _slider(key, label, vmin, vmax, default, fmt):
     with dpg.group():
         dpg.add_text(label)
         dpg.add_slider_float(tag=key, label="",
                              default_value=default, min_value=vmin, max_value=vmax,
-                             callback=_on_param_change, user_data=key,
-                             width=100, height=80, vertical=True, format=fmt)
+                             callback=_on_change, user_data=key,
+                             width=100, height=70, vertical=True, format=fmt)
 
-def _on_lfo_change(sender, app_data, user_data):
-    with _params_lock:
-        _params[user_data] = app_data
+def _lfo_slider(tag, vmin, vmax, default):
+    dpg.add_slider_float(tag=tag, label="",
+                         default_value=default, min_value=vmin, max_value=vmax,
+                         callback=_on_change, user_data=tag,
+                         width=65, height=35, vertical=True)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Main
