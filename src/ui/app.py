@@ -175,11 +175,11 @@ def _audio_callback(outdata, frames, time_info, status):
                 break
 
     # ── Render pool + effects ──────────────────────────────────────────
-    _pool.render(outdata)
-    _ssb.write(outdata.copy())
+    _pool.render(outdata.T)
+    _ssb.write(outdata.T.copy())
     _delay_net.set_feedback(p['feedback'])
     _delay_net.wet_mix = 0.05 + p['feedback'] * 0.7
-    outdata[:] = _delay_net.process(outdata)
+    outdata[:] = _delay_net.process(outdata.T).T
 
 # ═══════════════════════════════════════════════════════════════════════
 # Audio Stream
