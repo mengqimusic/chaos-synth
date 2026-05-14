@@ -532,3 +532,85 @@ class DelayNetwork:
 # ═══════════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════════
 
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TimbreMap — 2520 (exciter × body × modulator) combo 的一维排列管理
+# ═══════════════════════════════════════════════════════════════════════
+
+class TimbreMap:
+    def __init__(self, seed=42):
+        self.rng = np.random.RandomState(seed)
+        all_combos = [(e,b,m) for e in range(12) for b in range(10) for m in range(7)]
+        self.all_combos = all_combos
+        self.maps = self._build_maps()
+        self.current_map = "Gradual"
+        self._arrangement = self.maps[self.current_map]
+
+    def _build_maps(self):
+        maps = {}
+        all_c = self.all_combos
+        maps["Gradual"] = sorted(all_c, key=lambda c: (c[0], c[1], c[2]))
+        maps["Dirty"] = sorted(all_c, key=lambda c: (-c[0], c[1], c[2]))
+        maps["Clean→Broken"] = sorted(all_c, key=lambda c: (c[1], c[0], c[2]))
+        body_order = {0:0,2:1,4:2,5:3, 1:4,3:5,6:6,7:7,8:8,9:9}
+        maps["Strike→Sing"] = sorted(all_c, key=lambda c: (body_order[c[1]], c[0], c[2]))
+        exc_tuned = {0:0,4:1,6:2,2:3,5:4,8:5,7:6,1:7,10:8,9:9,3:10,11:11}
+        maps["Tuned→Noise"] = sorted(all_c, key=lambda c: (exc_tuned[c[0]], c[1], c[2]))
+        maps["Tight→Vast"] = sorted(all_c, key=lambda c: (c[2], c[1], c[0]))
+        # Morton Z-order
+        def morton_key(c):
+            def p1b2(n):
+                n &= 0x3ff; n = (n|(n<<16))&0x30000ff; n = (n|(n<<8))&0x300f00f
+                n = (n|(n<<4))&0x30c30c3; n = (n|(n<<2))&0x9249249; return n
+            return p1b2(c[0])|(p1b2(c[1])<<1)|(p1b2(c[2])<<2)
+        maps["Full Jump"] = sorted(all_c, key=morton_key)
+        rng = np.random.RandomState(42)
+        shuffled = all_c.copy(); rng.shuffle(shuffled)
+        maps["Random"] = shuffled
+        return maps
+
+    def set_map(self, name):
+        if name in self.maps:
+            self.current_map = name
+            self._arrangement = self.maps[name]
+
+    def get_combo(self, position):
+        idx = int(np.clip(position,0,1) * (len(self._arrangement)-1))
+        return self._arrangement[idx]
+
+    @property
+    def map_names(self):
+        return list(self.maps.keys())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# LFO — 低频振荡器 (sine/triangle/square/saw/random S&H)
+# ═══════════════════════════════════════════════════════════════════════
+
+class LFO:
+    WAVEFORMS = ["Sine","Triangle","Square","Saw","Random"]
+    def __init__(self, name="LFO1"):
+        self.name = name; self.waveform="Sine"; self.rate=1.0
+        self.depth=0.0; self.target="Pitch"
+        self._phase=0.0; self._last_random=0.0; self._value=0.0
+
+    def tick(self, dt):
+        self._phase += self.rate * dt
+        self._phase %= 1.0
+        self._value = self._sample(self._phase)
+        return self._value
+
+    def _sample(self, phase):
+        if self.waveform=="Sine": return float(np.sin(2*np.pi*phase))
+        elif self.waveform=="Triangle": return float(4*abs(phase-0.5)-1)
+        elif self.waveform=="Square": return 1.0 if phase<0.5 else -1.0
+        elif self.waveform=="Saw": return float(2*phase-1)
+        elif self.waveform=="Random":
+            if phase < 0.01: self._last_random = float(np.random.uniform(-1,1))
+            return self._last_random
+        return 0.0
+
+    @property
+    def value(self):
+        return self._value if self.depth>0.001 and self.rate>0.001 else 0.0
