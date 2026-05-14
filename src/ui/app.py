@@ -156,6 +156,13 @@ def _audio_callback(outdata, frames, time_info, status):
                     ssb_grain = _ssb.snatch(length=len(g_slice))
                     mix = min(len(g_slice), len(ssb_grain))
                     g_slice = g_slice[:mix] * (1.0 - p['feedback'] * 0.6) + ssb_grain[:mix] * p['feedback'] * 0.6
+                # Cosine fade-in/fade-out to prevent clicks at grain boundaries
+                fade_len = min(16, len(g_slice))
+                if fade_len > 0:
+                    fade_in = 0.5 - 0.5 * np.cos(np.pi * np.arange(fade_len) / fade_len)
+                    fade_out = 0.5 - 0.5 * np.cos(np.pi * np.arange(fade_len)[::-1] / fade_len)
+                    g_slice[:fade_len] *= fade_in.astype(np.float32)
+                    g_slice[-fade_len:] *= fade_out.astype(np.float32)
                 v['buffer'][:len(g_slice)] = g_slice
                 if len(g_slice) < len(v['buffer']):
                     v['buffer'][len(g_slice):] = 0.0
