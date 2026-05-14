@@ -163,6 +163,9 @@ def _audio_callback(outdata, frames, time_info, status):
                     fade_out = 0.5 - 0.5 * np.cos(np.pi * np.arange(fade_len)[::-1] / fade_len)
                     g_slice[:fade_len] *= fade_in.astype(np.float32)
                     g_slice[-fade_len:] *= fade_out.astype(np.float32)
+                # Ensure buffer is large enough (grain may have been extended)
+                if len(g_slice) > len(v['buffer']):
+                    v['buffer'] = np.zeros(len(g_slice), dtype=np.float32)
                 v['buffer'][:len(g_slice)] = g_slice
                 if len(g_slice) < len(v['buffer']):
                     v['buffer'][len(g_slice):] = 0.0
@@ -172,11 +175,11 @@ def _audio_callback(outdata, frames, time_info, status):
                 break
 
     # ── Render pool + effects ──────────────────────────────────────────
-    _pool.render(outdata.T)
-    _ssb.write(outdata.T.copy())
+    _pool.render(outdata)
+    _ssb.write(outdata.copy())
     _delay_net.set_feedback(p['feedback'])
     _delay_net.wet_mix = 0.05 + p['feedback'] * 0.7
-    outdata[:] = _delay_net.process(outdata.T).T
+    outdata[:] = _delay_net.process(outdata)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Audio Stream
